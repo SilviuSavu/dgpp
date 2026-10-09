@@ -598,6 +598,8 @@ struct GlmDsaFamily final : ServeFamily {
   int world = 1;
   dgpp::LatentFormat kv_format = dgpp::LatentFormat::kBf16;
   std::unique_ptr<dgpp::GlmDsaModel> model;
+  std::string dflash;
+
   GlmDsaFamily(const std::string& checkpoint, int world_, dgpp::LatentFormat fmt)
       : cfg(dgpp::GlmDsaTextConfig::from_json_file((fs::path(checkpoint) / "config.json").string())),
         ckpt(checkpoint), world(world_), kv_format(fmt) {}
@@ -623,7 +625,7 @@ struct GlmDsaFamily final : ServeFamily {
     return dgpp::GlmDsaModel::plan_memory(
         cfg, forward_rows, context, fabric ? rank : 0, fabric ? world_ : 1,
         fabric ? dgpp::GlmDsaResidency::Resident : dgpp::GlmDsaResidency::Streaming, slots,
-        fabric && mtp, decode_rows, kv_format, /*serving_logits=*/true);
+        fabric && mtp, decode_rows, kv_format, /*serving_logits=*/true, dflash);
   }
   size_t snapshot_bytes(int world_, bool mtp) const override {
     return dgpp::GlmDsaModel::session_snapshot_bytes(cfg, world_, mtp);

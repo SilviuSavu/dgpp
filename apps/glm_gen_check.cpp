@@ -81,6 +81,7 @@
 #include "loaders/hf_cache.hpp"
 #include "loaders/minijson.hpp"
 #include "text/chat_template.hpp"
+#include "kernels/latent_format.hpp"
 #include "models/glm/fabric_engine.hpp"
 #include "models/glm/forward.hpp"
 #include "models/glm/gen_engine.hpp"
@@ -414,6 +415,9 @@ int g_gr_probe_layers = 0;
 // --group-check-b: the second prompt of the grouped-prefill site check (below).
 static std::string g_group_check_b;
 static std::vector<int64_t> g_group_check_b_tokens;
+// --kv-format: the DSA latent cache's storage format for the fabric run's
+// model (bf16 default; the teacher-forced KV-dtype A/B passes fp8/fp4 here).
+dgpp::LatentFormat g_kv_format = dgpp::LatentFormat::kBf16;
 
 // The memory receipt: exactly what the model pre-allocates for this knob
 // combination, by region, plus the per-request reserve math. Runs with or
@@ -1569,7 +1573,8 @@ int run(const GlmTextConfig& cfg, const std::string& ckpt, int world,
         resident ? dgpp::GlmResidency::Resident
                  : dgpp::GlmResidency::Streaming,
         dgpp::GlmHeadSharding::VocabSharded,
-        /*max_requests=*/g_group_check_b_tokens.empty() ? 1 : 2, mtp);
+        /*max_requests=*/g_group_check_b_tokens.empty() ? 1 : 2, mtp,
+        g_kv_format);
     if (g_gr_probe_layers > 0) model.set_gr_probe_layers(g_gr_probe_layers);
     const double construct_s = std::chrono::duration<double>(
                                    std::chrono::steady_clock::now() -
@@ -1963,6 +1968,14 @@ int main(int argc, char** argv) {
     else if (a == "--group-check-b") g_group_check_b = next();
     else if (a == "--decode-graph") decode_graph = true;
     else if (a == "--mtp") mtp = true;
+    else if (a == "--kv-format") {
+      const auto f = dgpp::latent_format_from_string(next());
+      if (!f) {
+        DGPP_LOG_ERROR("--kv-format must be bf16, fp8, fp4, fp8_block or fp4_block");
+        return 1;
+      }
+      g_kv_format = *f;
+    }
     else if (a == "--engine") {
       const std::string v = next();
       if (v == "incremental") incremental = true;

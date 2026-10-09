@@ -335,7 +335,8 @@ add_library(dgpp_models_glm_dsa_layers STATIC
   src/models/glm_dsa/dflash2_model.cpp)
 target_include_directories(dgpp_models_glm_dsa_layers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dgpp_models_glm_dsa_layers
-  PUBLIC dgpp_models_glm_dsa dgpp_models_glm_dsa_loader dgpp_models_dsa dgpp_models_moe dgpp_models_glm dgpp_kernels CUDA::cudart)
+  PUBLIC dgpp_models_glm_dsa dgpp_models_glm_dsa_loader dgpp_models_dsa dgpp_models_moe dgpp_models_glm
+         dgpp_models_qwen_loader dgpp_kernels CUDA::cudart)
 dgpp_set_common(dgpp_models_glm_dsa_layers)
 
 # Full GLM-5.3 (2026-09-12, docs/glm53_plan.md): the host-side model description.
@@ -825,6 +826,7 @@ add_executable(unit_tests
   tests/unit/glm4_binding_test.cpp
   tests/unit/glm_dsa_config_test.cpp
   tests/unit/glm_dsa_binding_test.cpp
+  tests/unit/glm_dsa_dflash2_test.cpp
   tests/unit/dsv41_config_test.cpp
   tests/unit/dsv41_binding_test.cpp
   tests/unit/dsv4_config_test.cpp
@@ -839,6 +841,7 @@ target_link_libraries(unit_tests PRIVATE CUDA::cudart dgpp_loaders
                                         dgpp_models_glm dgpp_models_qwen dgpp_models_qwen_loader
                                         dgpp_models_glm4
                                         dgpp_models_glm_dsa dgpp_models_dsv41 dgpp_models_dsv4 dgpp_models_mimo
+                                        dgpp_models_glm_dsa_layers
                                         dgpp_rope_scaling
                                         dgpp_net dgpp_serve Threads::Threads)
 target_compile_definitions(unit_tests PRIVATE DGPP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")

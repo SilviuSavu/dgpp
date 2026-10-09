@@ -2841,6 +2841,23 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
           " (rows " + std::to_string(verify.rows) + ", accepted " +
           std::to_string(verify.accepted) + ")");
     model_->session_graph_settle(req, verify.accepted, rows);
+    // DGPP_DFGLM_TRACE=1: the block drafter's step evidence — the fed
+    // drafts against the verify's winners (shift-vs-garbage in one line).
+    if (block_ && std::getenv("DGPP_DFGLM_TRACE") != nullptr)
+      DGPP_LOG_INFO("dflash2 slot {}: pos {} fed {} vs winners {} -> accepted {}",
+                    req, model_->session_position(req) - static_cast<int64_t>(verify.accepted),
+                    [&] {
+                      std::string s;
+                      const std::vector<int32_t>& d = fed_drafts_[static_cast<size_t>(req)];
+                      for (size_t i = 0; i < d.size(); ++i) s += (i ? "," : "") + std::to_string(d[i]);
+                      return s;
+                    }(),
+                    [&] {
+                      std::string s;
+                      for (int r = 0; r < rows; ++r) s += (r ? "," : "") + std::to_string(verify.winners[r]);
+                      return s;
+                    }(),
+                    verify.accepted);
     // The prefix cache's hop snapshot (M7 under the multi-row step): armed
     // by the scheduler for the aligned position row 1 sat on; taken from
     // the state after row 0 when row 1 stood — here, before another slot's

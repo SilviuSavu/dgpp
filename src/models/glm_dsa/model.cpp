@@ -112,7 +112,6 @@ GlmDsaModel::GlmDsaModel(const GlmDsaTextConfig& cfg, const std::string& checkpo
   log_memory_ledger("glm_dsa: loader opened");
   const int H = cfg_.hidden_size;
   globals_ = loader_.load_globals();
-  if (!dflash2_dir.empty()) dflash2_init(dflash2_dir);
   log_memory_ledger("glm_dsa: globals resident");
   embed_sharded_ = globals_.embed_vocab_count < cfg_.vocab_size;
   if (embed_sharded_ && boundary == nullptr)
@@ -226,6 +225,7 @@ GlmDsaModel::GlmDsaModel(const GlmDsaTextConfig& cfg, const std::string& checkpo
     }
     mtp_r_ = dev_alloc<uint16_t>(M * H);
   }
+  if (!dflash2_dir.empty()) dflash2_init(dflash2_dir);
   DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
 }
 
@@ -347,6 +347,42 @@ GlmDsaModel::~GlmDsaModel() {
   cudaFree(mtp_r_);
   cudaFree(mtp_embed_rows_);
   cudaFree(d_iota_);
+  // The DFlash2 drafter's own allocations (the weights' arenas free
+  // themselves through DFlash2Weights' destructor).
+  df_planes_.free();
+  cudaFree(df_inv_freq_);
+  cudaFree(df_acc_);
+  cudaFree(df_t32_);
+  cudaFree(df_norm_);
+  cudaFree(df_kv_);
+  cudaFree(df_resid_);
+  cudaFree(df_x_);
+  cudaFree(df_xc_);
+  cudaFree(df_qkv_);
+  cudaFree(df_q_);
+  cudaFree(df_attn_);
+  cudaFree(df_attn_part_);
+  cudaFree(df_o_);
+  cudaFree(df_mlp_);
+  cudaFree(df_gate_);
+  cudaFree(df_up_);
+  cudaFree(df_h_);
+  cudaFree(df_zero_);
+  cudaFree(df_delta_);
+  cudaFree(df_logits_);
+  cudaFree(df_topk_ws_);
+  cudaFree(df_hidden32_);
+  cudaFree(df_ids_);
+  cudaFree(df_tok_);
+  cudaFree(df_sc_);
+  cudaFree(df_conf_);
+  cudaFree(df_pos_);
+  cudaFree(df_tokens_);
+  cudaFree(df_table_);
+  cudaFreeHost(df_tok_h_);
+  cudaFreeHost(df_io64_h_);
+  cudaFreeHost(df_mirror_h_);
+  cudaFreeHost(df_cands_h_);
 }
 
 int GlmDsaModel::table_slots() const {
@@ -357,7 +393,8 @@ GlmDsaModel::MemoryPlan GlmDsaModel::plan_memory(const GlmDsaTextConfig& cfg, in
                                                  int64_t max_cache_tokens, int tp_rank,
                                                  int tp_world, GlmDsaResidency residency,
                                                  int max_requests, bool mtp, int decode_rows,
-                                                 LatentFormat latent_format, bool serving_logits) {
+                                                 LatentFormat latent_format, bool serving_logits,
+                                                 const std::string& dflash2_dir) {
   if (max_tokens <= 0) throw std::invalid_argument("plan_memory: max_tokens must be positive");
   if (max_requests <= 0 || max_requests > kPickMaxRequests)
     throw std::invalid_argument("plan_memory: max_requests must be in [1, kPickMaxRequests]");
@@ -366,6 +403,16 @@ GlmDsaModel::MemoryPlan GlmDsaModel::plan_memory(const GlmDsaTextConfig& cfg, in
                                 std::to_string(decode_rows_cap()) + " rows (plan D9)");
   const int rows = std::max({kDecodeRows, decode_rows, max_requests});
   if (mtp && cfg.mtp_layer() < 0) throw std::invalid_argument("plan_memory: the config has no draft layer");
+  std::unique_ptr<DFlash2Config> dfcfg;
+  if (!dflash2_dir.empty()) {
+    if (mtp)
+      throw std::invalid_argument("plan_memory: the DFlash2 drafter replaces the MTP draft; enable one or the other");
+    dfcfg = std::make_unique<DFlash2Config>(DFlash2Config::from_json_file(dflash2_dir + "/config.json"));
+    dflash2_validate_against(*dfcfg, cfg);
+    if (!dfcfg->tp_divisible(tp_world))
+      throw std::invalid_argument(
+          "plan_memory: the DFlash2 drafter's heads / kv heads / MLP rows must divide across the world");
+  }
   const GlmDsaHeadSharding head = tp_world > 1 ? GlmDsaHeadSharding::VocabSharded : GlmDsaHeadSharding::Full;
   const GlmDsaLocalGeometry geo = GlmDsaLocalGeometry::from_config(cfg, tp_rank, tp_world, head);
   const int64_t cache_tokens =
@@ -432,6 +479,41 @@ GlmDsaModel::MemoryPlan GlmDsaModel::plan_memory(const GlmDsaTextConfig& cfg, in
   }
   if (mtp) plan.add("draft block (gathered hidden, the fused input, its residual, the sharded embedding's rows)",
                     M * H * 2 + M * 2 * H * 2 + M * H * 2 + M * H * 2 + M * 8);
+  if (dfcfg) {
+    plan.add("dflash2 drafter weights (this rank's slices)", dflash2_weights_bytes(*dfcfg, tp_world));
+    // The drafter's own KV planes: per layer one k and one v ring of
+    // window-covering blocks per request, plus the alias tables.
+    const int bt = GlmDFlash2Planes::kBlockTokens;
+    const int64_t ring_blocks =
+        (dfcfg->sliding_window + dfcfg->query_rows() + bt - 1) / bt + 1;
+    const int64_t ctx_blocks = (cache_tokens + bt - 1) / bt;
+    plan.add("dflash2 kv planes (per-request window rings + alias tables)",
+             static_cast<size_t>(dfcfg->num_hidden_layers) * 2 * R *
+                     static_cast<size_t>(ring_blocks) * static_cast<size_t>(bt) *
+                     static_cast<size_t>(dfcfg->local_kv_row(tp_world)) * 2 +
+                 R * static_cast<size_t>(ctx_blocks) * 4);
+    const size_t QR = static_cast<size_t>(dfcfg->query_rows());
+    const size_t CR = static_cast<size_t>(df_rows_cap());
+    const size_t dI = static_cast<size_t>(dfcfg->local_intermediate(tp_world));
+    const size_t dQW = static_cast<size_t>(dfcfg->local_q_row(tp_world));
+    const size_t dKV = static_cast<size_t>(dfcfg->local_kv_row(tp_world));
+    plan.add("dflash2 feature path",
+             2 * M * H * 4 + CR * H * 2 + CR * 2 * dKV * 2 +
+                 dfcfg->head_dim / 2 * 4);  // acc + tap F32, norm/kv scratch, rope table
+    plan.add("dflash2 block scratch",
+             QR * (5 * H * 2 + (dQW + 2 * dKV) * 2 + 2 * dQW * 2 + 3 * dI * 2 +
+                   2 * dfcfg->conv_taps * dfcfg->conv_groups() * 2 + 2 * 8) +
+                 dflash2_block_attn_partials_bytes(dfcfg->query_rows(), dfcfg->local_heads(tp_world)));
+    plan.add("dflash2 candidate buffers",
+             QR * (V * 4 + static_cast<size_t>(dfcfg->selector_rank) * 4 +
+                   static_cast<size_t>(dfcfg->selector_top_k) * (4 + 4) + 4) +
+                 static_cast<size_t>(max_requests) * static_cast<size_t>(dfcfg->drafts()) * 4 +
+                 dflash2_topk_ws_bytes(static_cast<int64_t>(V), dfcfg->query_rows(),
+                                       dfcfg->selector_top_k) +
+                 (tp_world > 1
+                      ? dflash2_topk_table_elems(dfcfg->query_rows(), dfcfg->selector_top_k, tp_world) * 2
+                      : 0));
+  }
   (void)R;
   if (staging > 0) {
     // The constructor materializes the stack before the caches, so the

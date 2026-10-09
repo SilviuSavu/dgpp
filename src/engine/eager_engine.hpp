@@ -327,8 +327,18 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
       // unchanged around it; a capture breakage falls back to the eager
       // batch inside the model call.
       const bool want_graph = model_->dflash_verify_graph() && model_->dflash_graph_verify_available();
-      auto outs = want_graph ? model_->session_verify_batch_graph(reqs, feds, &offs)
-                             : model_->session_verify_batch(reqs, feds, &offs);
+      // The captured static verify is the model's opt-in (Qwen's
+      // session_verify_batch_graph); families without it never set
+      // dflash_verify_graph, so the call is compile-time absent.
+      std::vector<typename Model::Outputs> outs;
+      if (want_graph) {
+        if constexpr (requires { model_->session_verify_batch_graph(reqs, feds, &offs); })
+          outs = model_->session_verify_batch_graph(reqs, feds, &offs);
+        else
+          throw std::logic_error("eager engine: dflash_verify_graph without the captured verify");
+      } else {
+        outs = model_->session_verify_batch(reqs, feds, &offs);
+      }
       const long long ph2 = ph ? ns_now() : 0;
       std::vector<std::vector<int32_t>> out(reqs.size());
       // Batched redrafts (engine.dflash_draft_batch): one stacked block

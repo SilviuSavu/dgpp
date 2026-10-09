@@ -42,8 +42,13 @@
 #include "loaders/architecture.hpp"
 #include "net/collective_bus.hpp"
 #include "loaders/hf_cache.hpp"
+#include "kernels/latent_format.hpp"
 #include "models/glm_dsa/config.hpp"
 #include "models/glm_dsa/model.hpp"
+
+// --kv-format: the DSA latent cache storage format (bf16 default; the
+// teacher-forced KV-dtype A/B passes fp8/fp4 here).
+static dgpp::LatentFormat g_kv_format = dgpp::LatentFormat::kBf16;
 
 int main(int argc, char** argv) {
   std::string model_id, ckpt, ids_text, dump_states, peer, image_dir, text, teacher_file;
@@ -58,7 +63,12 @@ int main(int argc, char** argv) {
   try {
     for (int i = 1; i < argc; ++i) {
       const std::string a = argv[i];
-      if (a == "--model") model_id = next(i);
+      if (a == "--kv-format") {
+        const auto f = dgpp::latent_format_from_string(next(i));
+        if (!f) throw std::runtime_error("--kv-format must be bf16, fp8, fp4, fp8_block or fp4_block");
+        g_kv_format = *f;
+      }
+      else if (a == "--model") model_id = next(i);
       else if (a == "--checkpoint-dir") ckpt = next(i);
       else if (a == "--ids") ids_text = next(i);
       else if (a == "--text") text = next(i);              // tokenized with the checkpoint's tokenizer
@@ -139,7 +149,8 @@ int main(int argc, char** argv) {
       reducer = std::make_unique<dgpp::BusBoundaryReducer>(*bus, 600000);
     }
     const auto t0 = std::chrono::steady_clock::now();
-    dgpp::GlmDsaModel model(cfg, ckpt, T + decode_steps, T + decode_steps + 64, residency, reducer.get(), rank, world);
+    dgpp::GlmDsaModel model(cfg, ckpt, T + decode_steps, T + decode_steps + 64, residency, reducer.get(), rank, world,
+                          /*max_requests=*/1, /*mtp=*/false, /*decode_rows=*/0, g_kv_format);
     const auto t1 = std::chrono::steady_clock::now();
     const dgpp::GlmDsaModel::Outputs out =
         model.forward(ids, teacher_file.empty() || !dump_states.empty());

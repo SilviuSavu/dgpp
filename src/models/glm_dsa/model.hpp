@@ -64,6 +64,7 @@
 #include "kernels/glm_spec.hpp"
 #include "kernels/l2_prefetch.hpp"
 #include "kernels/latent_format.hpp"
+#include "kernels/sample_pick.hpp"
 #include "models/dsa_geometry.hpp"
 #include "models/dsa_layer.hpp"
 #include "models/dsa_state.hpp"
@@ -114,7 +115,8 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
                                 GlmDsaResidency residency = GlmDsaResidency::Streaming,
                                 int max_requests = 1, bool mtp = false, int decode_rows = 0,
                                 LatentFormat latent_format = LatentFormat::kBf16,
-                                bool serving_logits = false);
+                                bool serving_logits = false,
+                                const std::string& dflash2_dir = "");
 
   // The cold diagnostic forward: one request on slot 0 (which must be
   // closed), fresh state, every row's logits; the slot is closed after.
@@ -169,6 +171,82 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
   void snapshot_chain_state(int) {}
   void restore_chain_state(int) {}
 
+  // ---- the DFlash2 drafter (the GLM port, src/models/glm_dsa/dflash2.*) ----
+  // Every run_rows pass also feeds the drafter: the tap layers' residual
+  // streams accumulate through the split fc, get the hidden_norm, and land
+  // as each draft layer's K/V in the drafter's own window planes at the
+  // run's positions (rejected verify rows land too and are masked by
+  // position — the planes need no rollback). dflash2_draft runs the block
+  // [bonus, mask x drafts] through the six bidirectional layers over the
+  // plane context; each mask row's top-K goes through the reference
+  // chained selector walk, which proposes the following `drafts()` tokens.
+  // The graph worlds record the same block forward inside the step's
+  // replay (session_graph_capture_block_draft[_batch]) off the device
+  // verdict, feeding the next replay's rows and the drafts' pinned mirror.
+  // Public: the engines bind the drafter through requires-probes on these.
+  bool dflash2_enabled() const { return dflash2_; }
+  int dflash2_drafts() const { return dflash2_ ? dfcfg_.drafts() : 0; }
+  bool dflash_verify_graph() const { return false; }
+  bool dflash_graph_verify_available() const { return false; }
+  bool dflash_draft_batch() const { return dflash2_ && df_batch_ > 1; }
+  int dflash_depth() const { return -1; }
+  // False without a draft (the context bound): the caller runs the step
+  // without speculation.
+  bool dflash2_draft(int req, int64_t bonus, std::vector<int32_t>* drafts);
+  // The stacked redraft: one block forward for every slot (the row-wise
+  // GEMMs/norms/convs over slots*query_rows rows; the per-slot calls at
+  // row offsets). drafts[i] is slot i's proposals, empty when that slot
+  // has no draft.
+  void dflash2_draft_batch(const std::vector<int>& reqs, const std::vector<int64_t>& bonuses,
+                           std::vector<std::vector<int32_t>>* drafts);
+  int dflash2_batch_slots() const { return df_batch_; }
+  // The recorded block draft (the graph engine's block proposal at every
+  // world): off the verify's device verdict — the anchor is its next
+  // token, the block's positions follow the committed device position —
+  // the block forward, the mask rows' head rows and their top-K (world>1:
+  // the ranks' slice lists merged through one boundary fold), the selector
+  // walk, the slot's next feed [next, drafts] and the drafts' pinned
+  // mirror. Kernel nodes only.
+  void session_graph_capture_block_draft(int req, const PickVerdict* verdict);
+  // The fixed batch's form: every slot's block off its verify verdict
+  // (slot q == request q) in one stacked block forward; the feeds and
+  // mirrors of all slots. An inactive slot's rows run at position -1 (no
+  // state write) and its feed is zeroed.
+  void session_graph_capture_block_draft_batch(const PickVerdict* verdicts, int requests);
+  // The sampled requests' block proposals (the engine's draft rule): the
+  // recorded walk draws each draft from the selector's softmax at the
+  // request's draft temperature and writes the set it drew from to
+  // proposals[req * stride + l] (and the pinned mirror), the next verify's
+  // ratio rule; a greedy request keeps the argmax and n = 0. `specs` is
+  // the engine's device SampleSpec table (one per slot). Null specs: the
+  // argmax walk, no proposals. Before the first capture.
+  void dflash2_arm_proposals(const SampleSpec* specs, DraftProposal* proposals,
+                             DraftProposal* proposals_host, int stride) {
+    if (specs != nullptr && (proposals == nullptr || stride < dfcfg_.drafts()))
+      throw std::invalid_argument("dflash2_arm_proposals: proposals / stride");
+    df_specs_ = specs;
+    df_props_ = proposals;
+    df_props_h_ = proposals_host;
+    df_props_stride_ = stride;
+  }
+  bool dflash2_proposals_armed() const { return df_specs_ != nullptr; }
+  // The selector's confidence per draft, [max_requests][drafts] written by
+  // every walk (recorded or eager) at the slot's row — the scheduled
+  // verify depth's input for the block drafter (engine.mtp_schedule).
+  const float* dflash2_confidence() const { return df_conf_; }
+  // The mirror the recorded draft of slot `req` publishes (readable once
+  // the replay's end event has passed).
+  const int32_t* block_drafts_host(int req) const {
+    return df_mirror_h_ + static_cast<size_t>(req) * static_cast<size_t>(dfcfg_.drafts());
+  }
+  // The mask rows' top-k candidate ids the recorded draft walked
+  // ([drafts][block_candidates()] per slot; the engine's acceptance
+  // diagnostics rank the verify's correction among them).
+  int block_candidates() const { return dfcfg_.selector_top_k; }
+  const int32_t* block_candidates_host(int req) const {
+    return df_cands_h_ + static_cast<size_t>(req) * static_cast<size_t>(dfcfg_.drafts()) *
+                         static_cast<size_t>(dfcfg_.selector_top_k);
+  }
  private:
   static constexpr int kBlockTokens = 128;
   static constexpr int kPrefillChunkTokens = 2048;
@@ -290,17 +368,6 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
   uint16_t* mtp_in_ = nullptr;  // [M, 2H] [enorm(embed) | hnorm(h)]
   uint16_t* mtp_r_ = nullptr;   // [M, H] the draft's residual
 
-  // ---- the DFlash2 drafter (the GLM port, src/models/glm_dsa/dflash2.*) ----
-  // Eager v1 scope: dflash2_init loads and allocates, the tap hook in
-  // run_rows accumulates the feature path, dflash2_store_features builds
-  // the drafter's context planes, dflash2_draft proposes one block.
-  bool dflash2_enabled() const { return dflash2_; }
-  int dflash2_drafts() const { return dflash2_ ? dfcfg_.drafts() : 0; }
-  bool dflash_verify_graph() const { return false; }          // eager v1
-  bool dflash_graph_verify_available() const { return false; }
-  bool dflash_draft_batch() const { return false; }
-  int dflash_depth() const { return -1; }
-  bool dflash2_draft(int req, int64_t bonus, std::vector<int32_t>* drafts);
   void dflash2_init(const std::string& dflash2_dir);
   void dflash2_store_features(int T, const int32_t* d_req, const int64_t* d_pos);
   void df_block_layers(int slots, const int* reqs, bool capture);
@@ -317,7 +384,7 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
   uint16_t *df_resid_ = nullptr, *df_x_ = nullptr, *df_xc_ = nullptr, *df_qkv_ = nullptr;
   uint16_t *df_q_ = nullptr, *df_attn_ = nullptr, *df_o_ = nullptr, *df_mlp_ = nullptr;
   uint16_t *df_gate_ = nullptr, *df_up_ = nullptr, *df_h_ = nullptr;
-  uint16_t *df_embed_rows_ = nullptr, *df_table_ = nullptr;
+  uint16_t* df_table_ = nullptr;
   float* df_attn_part_ = nullptr;
   int32_t* df_zero_ = nullptr;
   uint16_t* df_delta_ = nullptr;
@@ -329,6 +396,17 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
   float* df_sc_ = nullptr;
   float* df_conf_ = nullptr;
   int64_t *df_pos_ = nullptr, *df_tokens_ = nullptr, *df_io64_h_ = nullptr;
+  // The stacked draft batch (dflash2_draft_batch / the batched recorded
+  // draft): slots per block forward at the decode batch's row ceiling.
+  int df_batch_ = 1;
+  // The recorded drafts' pinned mirrors (read after the replay's end
+  // event) and the engine's armed sampled-proposal tables.
+  int32_t* df_mirror_h_ = nullptr;
+  int32_t* df_cands_h_ = nullptr;
+  const SampleSpec* df_specs_ = nullptr;
+  DraftProposal* df_props_ = nullptr;
+  DraftProposal* df_props_h_ = nullptr;
+  int df_props_stride_ = 0;
   static constexpr int df_rows_cap() { return 2048; }
   int tp_rank_ = 0, tp_world_ = 1;
 };
