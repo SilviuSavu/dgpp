@@ -314,6 +314,7 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
   // windows' view).
   static constexpr int kBf12ExpandSlots = 1;
   void pack_layer_companions(int layer, const GlmDsaLayerResident& r);
+  void pack_head_companion();
   void finish_companions();
   void prefetch_bf16(const uint16_t* w, size_t bytes);
   static size_t bf12_plan_bytes(const GlmDsaTextConfig& cfg, int tp_rank, int tp_world, GlmDsaHeadSharding head,

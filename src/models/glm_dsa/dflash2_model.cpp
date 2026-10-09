@@ -10,6 +10,7 @@
 //   * the shared head is the target's vocab-sharded lm_head GEMM (Qwen's
 //     fused head_gemv);
 //   * the embed gather goes through the sharded-embedding scratch path.
+#include <chrono>
 #include <cmath>
 #include <vector>
 
@@ -40,6 +41,36 @@ void GlmDsaModel::dflash2_init(const std::string& dflash2_dir) {
   df_kvr_ = dfcfg_.local_kv_row(tp_world_);
   df_i_ = dfcfg_.local_intermediate(tp_world_);
   dfw_ = load_dflash2_weights(dfcfg_, dflash2_dir, stream_, tp_rank_, tp_world_, dflash2_fp8_);
+  // The drafter's bf12 companions (the Qwen lane's recipe, pack_companions):
+  // the five block matrices per layer — under fp8 only the k|v rows keep a
+  // bf16 copy (the feature path's GEMM reads them) — the fc taps and the
+  // hidden projection, packed beside the arena (one allocation, nothing
+  // released: "bf12" and "bf12+bf16" agree on the drafter; the stacked
+  // batches' 17+ rows take the streaming mma form, which reads bf16). The
+  // ctor's tail (finish_companions) runs after this whole init.
+  if (Bf12Companions::enabled()) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto pack = [&](const uint16_t* w, int64_t n, int64_t k) {
+      if (w != nullptr) bf12_.pack(w, n, k, gemm_, stream_);
+    };
+    const int64_t dH = dfcfg_.hidden_size, dI = df_i_;
+    const int64_t QW = df_qw_, KV = df_kvr_;
+    for (const DFlash2LayerWeights& w : dfw_.layers) {
+      if (w.qkv_fp8 != nullptr) {
+        pack(w.kv_rows, 2 * KV, dH);
+        continue;
+      }
+      pack(w.qkv, QW + 2 * KV, dH);
+      pack(w.o, dH, QW);
+      pack(w.gate, dI, dH);
+      pack(w.up, dI, dH);
+      pack(w.down, dH, dI);
+    }
+    for (size_t t = 0; t < dfcfg_.target_layer_ids.size(); ++t)
+      pack(dfw_.fc + t * static_cast<size_t>(dH) * dH, dH, dH);
+    pack(dfw_.hidden_projection, dfcfg_.selector_rank, dH);
+    bf12_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  }
   {
     std::vector<float> host(dfcfg_.head_dim / 2);
     for (size_t i = 0; i < host.size(); ++i)

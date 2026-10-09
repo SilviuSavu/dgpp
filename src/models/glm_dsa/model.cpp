@@ -133,7 +133,7 @@ GlmDsaModel::GlmDsaModel(const GlmDsaTextConfig& cfg, const std::string& checkpo
       const GlmDsaLayerResident& r = loader_.load_layer(l);
       if (pack) pack_layer_companions(l, r);
     }
-    if (pack) finish_companions();
+    if (pack) pack_head_companion();
     loader_.release_sources();
   }
   log_memory_ledger("glm_dsa: layers resident, sources released");
@@ -226,6 +226,9 @@ GlmDsaModel::GlmDsaModel(const GlmDsaTextConfig& cfg, const std::string& checkpo
     mtp_r_ = dev_alloc<uint16_t>(M * H);
   }
   if (!dflash2_dir.empty()) dflash2_init(dflash2_dir);
+  // The reserve sizes over every pack, the drafter's included (dflash2_init
+  // packs its matrices after the load): the tail call, before any capture.
+  if (Bf12Companions::enabled()) finish_companions();
   DGPP_CUDA_OK(cudaStreamSynchronize(stream_));
 }
 
@@ -266,14 +269,21 @@ void GlmDsaModel::pack_layer_companions(int layer, const GlmDsaLayerResident& r)
   bf12_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
-// The lm head's, the expansion scratch (one slot: no walk of this family
-// calls a matrix twice), and the summary.
-void GlmDsaModel::finish_companions() {
+// The lm head's companion: the last matrix the loader granted aside (the
+// session core learns the head's rows after the load: the globals' here).
+void GlmDsaModel::pack_head_companion() {
   const auto t0 = std::chrono::steady_clock::now();
-  // (The session core learns the head's rows after the load: the globals' here.)
   const int head_rows = globals_.lm_vocab_count > 0 ? globals_.lm_vocab_count : cfg_.vocab_size;
   bf12_.pack_and_release(globals_.lm_head, head_rows, cfg_.hidden_size, gemm_, stream_,
                          [&](const void* w) { return loader_.release_packed(-1, w); });
+  bf12_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+// After the last pack (the layers', the head's above, the drafter's in
+// dflash2_init): the expansion scratch (one slot: no walk of this family
+// calls a matrix twice) and the summary.
+void GlmDsaModel::finish_companions() {
+  const auto t0 = std::chrono::steady_clock::now();
   bf12_.finish(gemm_, kBf12ExpandSlots);
   bf12_s_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
   bf12_.log_summary(loader_.rank(), bf12_s_);
@@ -483,6 +493,25 @@ GlmDsaModel::MemoryPlan GlmDsaModel::plan_memory(const GlmDsaTextConfig& cfg, in
     plan.add(dflash2_fp8_ ? "dflash2 drafter weights (this rank's slices; the block matrices as fp8, the rest bf16)"
                           : "dflash2 drafter weights (this rank's slices)",
              dflash2_weights_bytes(*dfcfg, tp_world, dflash2_fp8_));
+    if (Bf12Companions::enabled()) {
+      // The drafter's 12-bit companions (dflash2_init packs them after the
+      // load): the five block matrices per layer — under fp8 only the k|v
+      // rows keep a bf16 copy (the feature path's GEMM) — the fc taps and
+      // the hidden projection. The bf16 arena stays (one allocation):
+      // "bf12" and "bf12+bf16" agree on the drafter.
+      const int64_t dH = dfcfg->hidden_size;
+      const int64_t QW = dfcfg->local_q_row(tp_world), KV = dfcfg->local_kv_row(tp_world);
+      const int64_t dI = dfcfg->local_intermediate(tp_world);
+      size_t companions =
+          dflash2_fp8_
+              ? static_cast<size_t>(dfcfg->num_hidden_layers) * Bf12Companions::planned_bytes(2 * KV, dH)
+              : static_cast<size_t>(dfcfg->num_hidden_layers) *
+                    (Bf12Companions::planned_bytes(QW + 2 * KV, dH) + Bf12Companions::planned_bytes(dH, QW) +
+                     2 * Bf12Companions::planned_bytes(dI, dH) + Bf12Companions::planned_bytes(dH, dI));
+      companions += dfcfg->target_layer_ids.size() * Bf12Companions::planned_bytes(dH, dH);
+      companions += Bf12Companions::planned_bytes(dfcfg->selector_rank, dH);
+      plan.add("dflash2 bf12 companions (the bf16 arena stays)", companions);
+    }
     // The drafter's own KV planes: per layer one k and one v ring of
     // window-covering blocks per request, plus the alias tables.
     const int bt = GlmDFlash2Planes::kBlockTokens;
