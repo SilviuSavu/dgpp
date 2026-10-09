@@ -2241,6 +2241,7 @@ int main(int argc, char** argv) {
     return 2;
   }
   dgpp::Qwen35Model::set_dflash2_weights_fp8(dflash_weights == "fp8");
+  dgpp::GlmDsaModel::set_dflash2_weights_fp8(dflash_weights == "fp8");
   if (dflash_depth < 0 || dflash_depth > 7) {
     DGPP_LOG_ERROR("engine.dflash_depth (--dflash-depth) must be in [0, 7], got {}", dflash_depth);
     return 2;

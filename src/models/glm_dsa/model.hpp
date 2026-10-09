@@ -106,6 +106,12 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
   ~GlmDsaModel();
   GlmDsaModel(const GlmDsaModel&) = delete;
   GlmDsaModel& operator=(const GlmDsaModel&) = delete;
+  // engine.dflash_weights (checkpoint | fp8): the drafter's five block
+  // matrices stream as E4M3 payloads with fp32 block-128 scales instead of
+  // bf16 (the Qwen lane's recipe; lossy for the proposals only — the
+  // verify is exact whatever the drafter proposes). Set before
+  // construction, like Qwen35Model::set_dflash2_weights_fp8.
+  static void set_dflash2_weights_fp8(bool on) { dflash2_fp8_ = on; }
 
   // Every byte the constructor (and its layer objects) will allocate for
   // a shape, from the same formulas BEFORE anything is allocated.
@@ -250,6 +256,7 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
  private:
   static constexpr int kBlockTokens = 128;
   static constexpr int kPrefillChunkTokens = 2048;
+  inline static bool dflash2_fp8_ = false;  // set_dflash2_weights_fp8
   // No state families beside the pool's blocks: a 16-byte zero stamp keeps
   // the prefix arena's slots addressable (it refuses a zero-byte model).
   static constexpr size_t kSnapshotStamp = 16;

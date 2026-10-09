@@ -480,7 +480,9 @@ GlmDsaModel::MemoryPlan GlmDsaModel::plan_memory(const GlmDsaTextConfig& cfg, in
   if (mtp) plan.add("draft block (gathered hidden, the fused input, its residual, the sharded embedding's rows)",
                     M * H * 2 + M * 2 * H * 2 + M * H * 2 + M * H * 2 + M * 8);
   if (dfcfg) {
-    plan.add("dflash2 drafter weights (this rank's slices)", dflash2_weights_bytes(*dfcfg, tp_world));
+    plan.add(dflash2_fp8_ ? "dflash2 drafter weights (this rank's slices; the block matrices as fp8, the rest bf16)"
+                          : "dflash2 drafter weights (this rank's slices)",
+             dflash2_weights_bytes(*dfcfg, tp_world, dflash2_fp8_));
     // The drafter's own KV planes: per layer one k and one v ring of
     // window-covering blocks per request, plus the alias tables.
     const int bt = GlmDFlash2Planes::kBlockTokens;

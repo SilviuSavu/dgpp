@@ -17,6 +17,7 @@
 #include "kernels/dflash2.hpp"
 #include "kernels/qsa.hpp"
 #include "kernels/kernels.hpp"
+#include "kernels/mma_gemv.hpp"
 #include "models/glm_dsa/config.hpp"
 #include "models/glm_dsa/dflash2.hpp"
 #include "models/glm_dsa/model.hpp"
@@ -38,7 +39,7 @@ void GlmDsaModel::dflash2_init(const std::string& dflash2_dir) {
   df_qw_ = dfcfg_.local_q_row(tp_world_);
   df_kvr_ = dfcfg_.local_kv_row(tp_world_);
   df_i_ = dfcfg_.local_intermediate(tp_world_);
-  dfw_ = load_dflash2_weights(dfcfg_, dflash2_dir, stream_, tp_rank_, tp_world_, false);
+  dfw_ = load_dflash2_weights(dfcfg_, dflash2_dir, stream_, tp_rank_, tp_world_, dflash2_fp8_);
   {
     std::vector<float> host(dfcfg_.head_dim / 2);
     for (size_t i = 0; i < host.size(); ++i)
@@ -189,8 +190,17 @@ void GlmDsaModel::df_block_layers(int slots, const int* reqs, bool capture) {
                  static_cast<size_t>(H), gemm_ws_, gemm_ws_bytes_, stream_);
     dflash2_grouped_conv_bf16(df_x_, df_delta_, w.attn_conv_base, df_xc_, R, QR, H, TAPS,
                               dfcfg_.conv_group_size, 2 * TAPS * G, stream_);
-    gemm_.matmul(df_xc_, w.qkv, df_qkv_, R, static_cast<int>(qkv_stride), H, DType::BF16,
-                 GemmOut::BF16, static_cast<size_t>(H), gemm_ws_, gemm_ws_bytes_, stream_);
+    // engine.dflash_weights fp8: the five block matrices stream as E4M3
+    // with fp32 block-128 scales (kernels/mma_gemv's decode form — the
+    // Qwen lane's recipe, 2026-10-05); lossy for the proposals only, the
+    // verify stays exact whatever the drafter proposes.
+    if (w.qkv_fp8 != nullptr)
+      launch_mma_gemv_fp8_bf16(df_xc_, static_cast<size_t>(H), w.qkv_fp8, w.qkv_scales, df_qkv_, R,
+                               static_cast<int>(qkv_stride), H, qkv_stride, 7, 7, stream_, gemm_ws_,
+                               gemm_ws_bytes_);
+    else
+      gemm_.matmul(df_xc_, w.qkv, df_qkv_, R, static_cast<int>(qkv_stride), H, DType::BF16,
+                   GemmOut::BF16, static_cast<size_t>(H), gemm_ws_, gemm_ws_bytes_, stream_);
     dflash2_norm_rope_bf16(df_qkv_, qkv_stride, w.q_norm, df_pos_, df_inv_freq_, df_q_, QW, R, NH, HD,
                            eps, stream_);
     dflash2_norm_rope_bf16(df_qkv_ + QW, qkv_stride, w.k_norm, df_pos_, df_inv_freq_, df_qkv_ + QW,
@@ -207,8 +217,12 @@ void GlmDsaModel::df_block_layers(int slots, const int* reqs, bool capture) {
                                df_attn_ + ro * QW, stream_);
     }
     uint16_t* ao = stage(df_o_, H);
-    gemm_.matmul(df_attn_, w.o, ao, R, H, QW, DType::BF16, GemmOut::BF16, QW, gemm_ws_,
-                 gemm_ws_bytes_, stream_);
+    if (w.o_fp8 != nullptr)
+      launch_mma_gemv_fp8_bf16(df_attn_, static_cast<size_t>(QW), w.o_fp8, w.o_scales, ao, R, H, QW,
+                               static_cast<size_t>(H), 7, 7, stream_, gemm_ws_, gemm_ws_bytes_);
+    else
+      gemm_.matmul(df_attn_, w.o, ao, R, H, QW, DType::BF16, GemmOut::BF16, QW, gemm_ws_,
+                   gemm_ws_bytes_, stream_);
     fold(ao, H);
     dflash2_grouped_conv_bf16(ao, df_delta_ + TAPS * G, w.attn_conv_base + static_cast<size_t>(TAPS) * H,
                               df_xc_, R, QR, H, TAPS, dfcfg_.conv_group_size, 2 * TAPS * G, stream_);
@@ -217,14 +231,25 @@ void GlmDsaModel::df_block_layers(int slots, const int* reqs, bool capture) {
                  static_cast<size_t>(H), gemm_ws_, gemm_ws_bytes_, stream_);
     dflash2_grouped_conv_bf16(df_x_, df_delta_, w.mlp_conv_base, df_xc_, R, QR, H, TAPS,
                               dfcfg_.conv_group_size, 2 * TAPS * G, stream_);
-    gemm_.matmul(df_xc_, w.gate, df_gate_, R, I, H, DType::BF16, GemmOut::BF16,
-                 static_cast<size_t>(H), gemm_ws_, gemm_ws_bytes_, stream_);
-    gemm_.matmul(df_xc_, w.up, df_up_, R, I, H, DType::BF16, GemmOut::BF16,
-                 static_cast<size_t>(H), gemm_ws_, gemm_ws_bytes_, stream_);
+    if (w.gate_fp8 != nullptr) {
+      launch_mma_gemv_fp8_bf16(df_xc_, static_cast<size_t>(H), w.gate_fp8, w.gate_scales, df_gate_, R, I,
+                               H, static_cast<size_t>(I), 7, 7, stream_, gemm_ws_, gemm_ws_bytes_);
+      launch_mma_gemv_fp8_bf16(df_xc_, static_cast<size_t>(H), w.up_fp8, w.up_scales, df_up_, R, I, H,
+                               static_cast<size_t>(I), 7, 7, stream_, gemm_ws_, gemm_ws_bytes_);
+    } else {
+      gemm_.matmul(df_xc_, w.gate, df_gate_, R, I, H, DType::BF16, GemmOut::BF16,
+                   static_cast<size_t>(H), gemm_ws_, gemm_ws_bytes_, stream_);
+      gemm_.matmul(df_xc_, w.up, df_up_, R, I, H, DType::BF16, GemmOut::BF16, static_cast<size_t>(H),
+                   gemm_ws_, gemm_ws_bytes_, stream_);
+    }
     swiglu_limit_bf16(df_gate_, df_up_, df_mlp_, static_cast<int64_t>(R) * I, INFINITY, stream_);
     uint16_t* mo = stage(df_o_, H);
-    gemm_.matmul(df_mlp_, w.down, mo, R, H, I, DType::BF16, GemmOut::BF16,
-                 static_cast<size_t>(I), gemm_ws_, gemm_ws_bytes_, stream_);
+    if (w.down_fp8 != nullptr)
+      launch_mma_gemv_fp8_bf16(df_mlp_, static_cast<size_t>(I), w.down_fp8, w.down_scales, mo, R, H, I,
+                               static_cast<size_t>(H), 7, 7, stream_, gemm_ws_, gemm_ws_bytes_);
+    else
+      gemm_.matmul(df_mlp_, w.down, mo, R, H, I, DType::BF16, GemmOut::BF16,
+                   static_cast<size_t>(I), gemm_ws_, gemm_ws_bytes_, stream_);
     fold(mo, H);
     dflash2_grouped_conv_bf16(mo, df_delta_ + TAPS * G, w.mlp_conv_base + static_cast<size_t>(TAPS) * H,
                               df_xc_, R, QR, H, TAPS, dfcfg_.conv_group_size, 2 * TAPS * G, stream_);
