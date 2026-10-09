@@ -510,7 +510,8 @@ void GlmMoeLayer::enqueue_host(const uint16_t* hidden, uint16_t* out_bf16,
   //    The inter dims come from the matrix views (the rank's slices).
   grouped_expert_chain(kernel, hidden, d_segs_, n_segs, max_rows,
                        shared ? d_segs_ + n_segs : nullptr, tokens, rows_total,
-                       stream, tile_cap ? d_tiles_ : nullptr, d_tile_count_, tile_cap);
+                       stream, tile_cap ? d_tiles_ : nullptr, d_tile_count_,
+                       tile_cap, d_views_prefill_);
 
   // 4. The ordered accumulation: per token its K slots in ascending expert
   //    id, then the shared row (weight 1), the fmaf chain from zero, one
@@ -704,7 +705,7 @@ void GlmMoeLayer::prefill_chain(const uint16_t* hidden, int tokens, cudaStream_t
                        tile_cap ? std::max(tokens, 1)
                                 : routed_seg_max_rows(d_segs_, E, std::max(tokens, 1), stream),
                        d_segs_ + E, tokens, rows_total, stream, tile_cap ? d_tiles_ : nullptr,
-                       d_tile_count_, tile_cap);
+                       d_tile_count_, tile_cap, d_views_prefill_);
 }
 
 bool GlmMoeLayer::mma_takes_grid() const {
@@ -756,7 +757,7 @@ void GlmMoeLayer::enqueue_prefill_f32(const uint16_t* hidden, float* out, int to
                        tile_cap ? std::max(tokens, 1)
                                 : routed_seg_max_rows(d_segs_, E, std::max(tokens, 1), stream),
                        /*shared_seg=*/nullptr, tokens, tk, stream, tile_cap ? d_tiles_ : nullptr,
-                       d_tile_count_, tile_cap);
+                       d_tile_count_, tile_cap, d_views_prefill_);
   accumulate_grouped(nullptr, out, /*shared_row0=*/-1, tokens, stream);
 }
 
@@ -823,7 +824,8 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
                                        int max_rows, const MoeSegment* shared_seg,
                                        int tokens, size_t rows_total,
                                        cudaStream_t stream, const MoeTile* tiles,
-                                       const int32_t* tile_count, int tile_cap) {
+                                       const int32_t* tile_count, int tile_cap,
+                                              const MoeExpertView* views) {
   const int H = static_cast<int>(cfg_.hidden);
   const bool fp4 = w_.nvfp4();
   const bool packq = w_.packq();
@@ -907,67 +909,67 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
                        uint16_t* out, int n, bool routed_arg) {
     const bool routed = routed_arg || shared_fp4;
     if (packq && mma)
-      launch_moe_grouped_mma_packq_bf16(hidden, H, sg, ns, mr, d_views_prefill_, which, out, I_max,
+      launch_moe_grouped_mma_packq_bf16(hidden, H, sg, ns, mr, views, which, out, I_max,
                                         n, H, routed_arg ? routed_bits : shared_bits, stream,
                                         d_rows_, routed_arg ? routed_sf : 0, packq_variant,
                                         routed_arg ? tiles : nullptr, tile_count, tile_cap);
     else if (packq)
-      launch_moe_grouped_gemv_packq_bf16(d_gather_, H, sg, ns, mr, split, d_views_prefill_,
+      launch_moe_grouped_gemv_packq_bf16(d_gather_, H, sg, ns, mr, split, views,
                                          which, out, I_max, n, H,
                                          routed_arg ? routed_bits : shared_bits, stream,
                                          routed_arg ? routed_sf : 0);
     else if (w4a4 && routed_arg)
-      launch_moe_grouped_w4a4_bf16(d_q_codes_, d_q_scales_, d_q_gs_, d_rows_, sg, ns, mr, d_views_prefill_, which, out,
+      launch_moe_grouped_w4a4_bf16(d_q_codes_, d_q_scales_, d_q_gs_, d_rows_, sg, ns, mr, views, which, out,
                                    I_max, n, H, stream);
     else if (mma && routed && fp4)
-      launch_moe_grouped_mma_fp4_bf16(hidden, H, sg, ns, mr, split, d_views_prefill_,
+      launch_moe_grouped_mma_fp4_bf16(hidden, H, sg, ns, mr, split, views,
                                       which, out, I_max, n, H, stream, d_rows_, fp4_group);
     else if (mma)
-      launch_moe_grouped_mma_bf16(hidden, H, sg, ns, mr, split, d_views_prefill_,
+      launch_moe_grouped_mma_bf16(hidden, H, sg, ns, mr, split, views,
                                   which, out, I_max, n, H, stream, d_rows_);
     else if (routed && fp4)
-      launch_moe_grouped_gemv_fp4_bf16(d_gather_, H, sg, ns, mr, split, d_views_prefill_,
+      launch_moe_grouped_gemv_fp4_bf16(d_gather_, H, sg, ns, mr, split, views,
                                        which, out, I_max, n, H, stream, fp4_group);
     else
-      launch_moe_grouped_gemv_bf16(d_gather_, H, sg, ns, mr, split, d_views_prefill_,
+      launch_moe_grouped_gemv_bf16(d_gather_, H, sg, ns, mr, split, views,
                                    which, out, I_max, n, H, stream);
   };
   auto gemm_f32 = [&](const MoeSegment* sg, int ns, int mr, int split, int k,
                       bool routed_arg) {
     const bool routed = routed_arg || shared_fp4;
     if (packq && mma && down_bf16_)
-      launch_moe_grouped_mma_packq_bf16(d_act_, I_max, sg, ns, mr, d_views_prefill_, 2,
+      launch_moe_grouped_mma_packq_bf16(d_act_, I_max, sg, ns, mr, views, 2,
                                         reinterpret_cast<uint16_t*>(d_down_), H, H, k,
                                         routed_arg ? routed_bits : shared_bits, stream, nullptr,
                                         routed_arg ? routed_sf : 0, packq_variant, routed_arg ? tiles : nullptr,
                                         tile_count, tile_cap);
     else if (packq && mma)
-      launch_moe_grouped_mma_packq_f32(d_act_, I_max, sg, ns, mr, d_views_prefill_, 2, d_down_, H,
+      launch_moe_grouped_mma_packq_f32(d_act_, I_max, sg, ns, mr, views, 2, d_down_, H,
                                        H, k, routed_arg ? routed_bits : shared_bits, stream,
                                        nullptr, routed_arg ? routed_sf : 0, packq_variant,
                                        routed_arg ? tiles : nullptr, tile_count, tile_cap);
     else if (packq)
-      launch_moe_grouped_gemv_packq_f32(d_act_, I_max, sg, ns, mr, split, d_views_prefill_,
+      launch_moe_grouped_gemv_packq_f32(d_act_, I_max, sg, ns, mr, split, views,
                                         2, d_down_, H, H, k,
                                         routed_arg ? routed_bits : shared_bits, stream,
                                         routed_arg ? routed_sf : 0);
     else if (w4a4 && routed_arg && down_bf16_)
-      launch_moe_grouped_w4a4_bf16(d_q_codes_, d_q_scales_, d_q_gs_, nullptr, sg, ns, mr, d_views_prefill_, 2,
+      launch_moe_grouped_w4a4_bf16(d_q_codes_, d_q_scales_, d_q_gs_, nullptr, sg, ns, mr, views, 2,
                                    reinterpret_cast<uint16_t*>(d_down_), H, H, k, stream);
     else if (w4a4 && routed_arg)
-      launch_moe_grouped_w4a4_f32(d_q_codes_, d_q_scales_, d_q_gs_, nullptr, sg, ns, mr, d_views_prefill_, 2, d_down_, H, H,
+      launch_moe_grouped_w4a4_f32(d_q_codes_, d_q_scales_, d_q_gs_, nullptr, sg, ns, mr, views, 2, d_down_, H, H,
                                   k, stream);
     else if (mma && routed && fp4)
-      launch_moe_grouped_mma_fp4_f32(d_act_, I_max, sg, ns, mr, split, d_views_prefill_,
+      launch_moe_grouped_mma_fp4_f32(d_act_, I_max, sg, ns, mr, split, views,
                                      2, d_down_, H, H, k, stream, nullptr, fp4_group);
     else if (mma)
-      launch_moe_grouped_mma_f32(d_act_, I_max, sg, ns, mr, split, d_views_prefill_,
+      launch_moe_grouped_mma_f32(d_act_, I_max, sg, ns, mr, split, views,
                                  2, d_down_, H, H, k, stream);
     else if (routed && fp4)
-      launch_moe_grouped_gemv_fp4_f32(d_act_, I_max, sg, ns, mr, split, d_views_prefill_,
+      launch_moe_grouped_gemv_fp4_f32(d_act_, I_max, sg, ns, mr, split, views,
                                       2, d_down_, H, H, k, stream, fp4_group);
     else
-      launch_moe_grouped_gemv_f32(d_act_, I_max, sg, ns, mr, split, d_views_prefill_,
+      launch_moe_grouped_gemv_f32(d_act_, I_max, sg, ns, mr, split, views,
                                   2, d_down_, H, H, k, stream);
   };
   // The packed tensor-core chain can run gate and up as one launch (each
@@ -976,7 +978,7 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
   // two launches — the activation re-gather is not what bounds the kernel).
   const bool paired = packq && mma && g_expert_gemm_pair && routed_bits == 4;
   if (paired)
-    launch_moe_grouped_mma_packq_bf16(hidden, H, segs, n_segs, max_rows, d_views_prefill_, 0, d_gate_, I_max,
+    launch_moe_grouped_mma_packq_bf16(hidden, H, segs, n_segs, max_rows, views, 0, d_gate_, I_max,
                                       I_r, H, routed_bits, stream, d_rows_, routed_sf, packq_variant, tiles,
                                       tile_count, tile_cap, d_up_, 1);
   else
@@ -1193,6 +1195,42 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
   } else {
     upload_expert_views(d_expert_views_, /*with_shared=*/w_.shared_nvfp4() || w_.shared_packq(),
                         stream);
+  }
+
+  // 3b. Multi-row walks (a speculative verify) ride the prefill chain's
+  //     grouped kernels instead: the segment table gives every expert ONE
+  //     weight read per step however many rows share it, where the slot
+  //     kernel re-streams the expert per row (a 2026-10-09 profile: 75 of
+  //     a 148 ms pass re-reading ~13 distinct experts' int4 weights per
+  //     layer for 8 rows). The decode pin holds — the unit gate pins the
+  //     slot kernel bitwise to this same grouped chain at multi-row
+  //     counts. One row keeps the slot launch (nothing to share, no
+  //     segment machinery to pay). The deferred-fold callers
+  //     (accumulate = false) keep the slot layout they read.
+  //     DGPP_MOE_DECODE_GROUPED: 0 (default) = off — the slot kernel,
+  //     expert-ordered, already streams the distinct experts once per step
+  //     at full bandwidth (a 2026-10-09 A/B: the grouped chain read less
+  //     DRAM but ran latency-bound at eight rows, 160 vs 148 ms a pass);
+  //     2 = from two rows; 1 = always.
+  static const int grouped_from = [] {
+    const char* e = std::getenv("DGPP_MOE_DECODE_GROUPED");
+    return e == nullptr ? 0 : std::atoi(e);
+  }();
+  const bool grouped = accumulate && grouped_from > 0 && tokens >= grouped_from &&
+                       d_segs_ != nullptr && d_gather_ != nullptr &&
+                       !shared_aside_takes(with_shared, tokens) &&
+                       (w_.shared_nvfp4() || w_.shared_packq());
+  if (grouped) {
+    const size_t tk = static_cast<size_t>(tokens) * K;
+    const size_t rows_total =
+        with_shared ? tk + static_cast<size_t>(tokens) : tk;
+    launch_moe_segment(d_ids_, tokens, K, E, d_rows_, d_slot_row_, d_segs_, stream);
+    grouped_expert_chain(MoeExpertKernel::kGemv, hidden, d_segs_, E, tokens,
+                         with_shared ? d_segs_ + E : nullptr, tokens, rows_total,
+                         stream, nullptr, nullptr, 0, table);
+    accumulate_grouped(out_bf16, out_f32,
+                       with_shared ? static_cast<int>(tk) : -1, tokens, stream);
+    return;
   }
 
   const int slots = tokens * (K + 1);

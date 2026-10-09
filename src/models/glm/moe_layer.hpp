@@ -227,7 +227,9 @@ class GlmMoeLayer {
                             const MoeSegment* shared_seg, int tokens,
                             size_t rows_total, cudaStream_t stream,
                             const MoeTile* tiles = nullptr,
-                            const int32_t* tile_count = nullptr, int tile_cap = 0);
+                            const int32_t* tile_count = nullptr,
+                            int tile_cap = 0,
+                            const MoeExpertView* views = nullptr);
   // Whether the routed chain's tensor-core launches take the tile list: the
   // wide packed int4 kernel (engine.expert_tile_list = false keeps the max_rows grid).
   bool packq_tile_list() const;
