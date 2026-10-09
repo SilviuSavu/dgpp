@@ -1,4 +1,5 @@
 #include "models/glm_dsa/model.hpp"
+#include "kernels/dflash2.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -83,12 +84,13 @@ std::vector<int> GlmDsaModel::index_ordinals(const GlmDsaTextConfig& cfg, bool m
 GlmDsaModel::GlmDsaModel(const GlmDsaTextConfig& cfg, const std::string& checkpoint_dir,
                          int max_tokens, int64_t max_cache_tokens, GlmDsaResidency residency,
                          BoundaryReducer* boundary, int tp_rank, int tp_world, int max_requests,
-                         bool mtp, int decode_rows, LatentFormat latent_format, bool serving_logits)
+                         bool mtp, int decode_rows, LatentFormat latent_format, bool serving_logits,
+                         const std::string& dflash2_dir)
     : cfg_(cfg),
       loader_(cfg, checkpoint_dir, tp_rank, tp_world, residency,
               tp_world > 1 ? GlmDsaHeadSharding::VocabSharded : GlmDsaHeadSharding::Full,
               mtp && residency == GlmDsaResidency::Resident),
-      latent_format_(latent_format) {
+      latent_format_(latent_format), tp_rank_(tp_rank), tp_world_(tp_world) {
   if (max_tokens <= 0) throw std::invalid_argument("GlmDsaModel: max_tokens must be positive");
   if (mtp && cfg_.mtp_layer() < 0) throw std::invalid_argument("GlmDsaModel: the config has no draft layer (mtp)");
   if (max_requests <= 0 || max_requests > kPickMaxRequests)
@@ -110,6 +112,7 @@ GlmDsaModel::GlmDsaModel(const GlmDsaTextConfig& cfg, const std::string& checkpo
   log_memory_ledger("glm_dsa: loader opened");
   const int H = cfg_.hidden_size;
   globals_ = loader_.load_globals();
+  if (!dflash2_dir.empty()) dflash2_init(dflash2_dir);
   log_memory_ledger("glm_dsa: globals resident");
   embed_sharded_ = globals_.embed_vocab_count < cfg_.vocab_size;
   if (embed_sharded_ && boundary == nullptr)
@@ -755,6 +758,15 @@ GlmDsaModel::Outputs GlmDsaModel::run_rows(const RowRun& run) {
         out.dsa_selections.push_back(std::move(sel));
       }
     }
+    // The drafter's tap: the layer's OUTPUT residual through that tap's fc
+    // slice, fp32-accumulated (the Qwen port's split-cat GEMM).
+    if (dflash2_ && df_tap_[layer] >= 0) {
+      const uint16_t* fc_t = dfw_.fc + static_cast<size_t>(df_tap_[layer]) * H * H;
+      gemm_.matmul(resid_, fc_t, df_t32_, T, H, H, DType::BF16, GemmOut::F32,
+                   static_cast<size_t>(H), gemm_ws_, gemm_ws_bytes_, stream_);
+      dflash2_acc_f32(df_acc_, df_t32_, static_cast<int64_t>(T) * H,
+                      df_tap_[layer] == 0 ? 0 : 1, stream_);
+    }
   }
   // Keep hidden rows for MTP; serving projects only each request's last
   // prefill row. All-row diagnostics and decode keep their full head.
@@ -773,6 +785,10 @@ GlmDsaModel::Outputs GlmDsaModel::run_rows(const RowRun& run) {
     const int nrows = run.num_spans > 0 ? T : std::min(T, max_decode_rows_);
     store_draft_hidden(h_ + static_cast<size_t>(T - nrows) * H, in.req_ids + (T - nrows), in.pos + (T - nrows), nrows);
   }
+  // Every run's rows also become the drafter's context planes at their
+  // positions (the Qwen port's contract: rejected verify rows included;
+  // the next draft's window mask hides them).
+  if (dflash2_) dflash2_store_features(T, in.req_ids, in.pos);
   if (run.decode) prefetch_.join(stream_);
   out = finish_run(run, std::move(out), packed_logits);
   if (!run.capture && traces) {

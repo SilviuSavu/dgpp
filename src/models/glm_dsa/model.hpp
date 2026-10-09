@@ -69,6 +69,7 @@
 #include "models/dsa_state.hpp"
 #include "models/glm/moe_layer.hpp"
 #include "models/glm_dsa/config.hpp"
+#include "models/glm_dsa/dflash2.hpp"
 #include "models/glm_dsa/loader.hpp"
 
 namespace dgpp {
@@ -99,7 +100,8 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
               int64_t max_cache_tokens, GlmDsaResidency residency = GlmDsaResidency::Streaming,
               BoundaryReducer* boundary = nullptr, int tp_rank = 0, int tp_world = 1,
               int max_requests = 1, bool mtp = false, int decode_rows = 0,
-              LatentFormat latent_format = LatentFormat::kBf16, bool serving_logits = false);
+              LatentFormat latent_format = LatentFormat::kBf16, bool serving_logits = false,
+              const std::string& dflash2_dir = "");
   ~GlmDsaModel();
   GlmDsaModel(const GlmDsaModel&) = delete;
   GlmDsaModel& operator=(const GlmDsaModel&) = delete;
@@ -287,6 +289,48 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
   uint16_t* mtp_h_ = nullptr;   // [M, H] the gathered hidden rows (decode rows)
   uint16_t* mtp_in_ = nullptr;  // [M, 2H] [enorm(embed) | hnorm(h)]
   uint16_t* mtp_r_ = nullptr;   // [M, H] the draft's residual
+
+  // ---- the DFlash2 drafter (the GLM port, src/models/glm_dsa/dflash2.*) ----
+  // Eager v1 scope: dflash2_init loads and allocates, the tap hook in
+  // run_rows accumulates the feature path, dflash2_store_features builds
+  // the drafter's context planes, dflash2_draft proposes one block.
+  bool dflash2_enabled() const { return dflash2_; }
+  int dflash2_drafts() const { return dflash2_ ? dfcfg_.drafts() : 0; }
+  bool dflash_verify_graph() const { return false; }          // eager v1
+  bool dflash_graph_verify_available() const { return false; }
+  bool dflash_draft_batch() const { return false; }
+  int dflash_depth() const { return -1; }
+  bool dflash2_draft(int req, int64_t bonus, std::vector<int32_t>* drafts);
+  void dflash2_init(const std::string& dflash2_dir);
+  void dflash2_store_features(int T, const int32_t* d_req, const int64_t* d_pos);
+  void df_block_layers(int slots, const int* reqs, bool capture);
+  void df_block_select(int slots, const int* reqs, bool capture);
+  bool dflash2_ = false;
+  DFlash2Config dfcfg_;
+  DFlash2Weights dfw_;
+  std::vector<int> df_tap_;
+  GlmDFlash2Planes df_planes_;
+  int df_nh_ = 0, df_kvh_ = 0, df_qw_ = 0, df_kvr_ = 0, df_i_ = 0;
+  float* df_inv_freq_ = nullptr;
+  float *df_acc_ = nullptr, *df_t32_ = nullptr;
+  uint16_t *df_norm_ = nullptr, *df_kv_ = nullptr;
+  uint16_t *df_resid_ = nullptr, *df_x_ = nullptr, *df_xc_ = nullptr, *df_qkv_ = nullptr;
+  uint16_t *df_q_ = nullptr, *df_attn_ = nullptr, *df_o_ = nullptr, *df_mlp_ = nullptr;
+  uint16_t *df_gate_ = nullptr, *df_up_ = nullptr, *df_h_ = nullptr;
+  uint16_t *df_embed_rows_ = nullptr, *df_table_ = nullptr;
+  float* df_attn_part_ = nullptr;
+  int32_t* df_zero_ = nullptr;
+  uint16_t* df_delta_ = nullptr;
+  float* df_logits_ = nullptr;
+  void* df_topk_ws_ = nullptr;
+  size_t df_topk_ws_bytes_ = 0;
+  float* df_hidden32_ = nullptr;
+  int32_t *df_ids_ = nullptr, *df_tok_ = nullptr, *df_tok_h_ = nullptr;
+  float* df_sc_ = nullptr;
+  float* df_conf_ = nullptr;
+  int64_t *df_pos_ = nullptr, *df_tokens_ = nullptr, *df_io64_h_ = nullptr;
+  static constexpr int df_rows_cap() { return 2048; }
+  int tp_rank_ = 0, tp_world_ = 1;
 };
 
 }  // namespace dgpp

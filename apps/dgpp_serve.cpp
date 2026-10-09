@@ -635,9 +635,10 @@ struct GlmDsaFamily final : ServeFamily {
         cfg, ckpt, forward_rows, pool_tokens,
         fabric ? dgpp::GlmDsaResidency::Resident : dgpp::GlmDsaResidency::Streaming, reducer,
         fabric ? rank : 0, fabric ? world_ : 1, slots, fabric && mtp, decode_rows, kv_format,
-        /*serving_logits=*/true);
+        /*serving_logits=*/true, dflash);
   }
   void destroy_model() override { model.reset(); }
+  void set_draft_model(const std::string& dir) override { dflash = dir; }
   size_t model_snapshot_bytes() const override { return model ? model->session_snapshot_bytes() : 0; }
   std::unique_ptr<ServeGraphEngine> make_graph_engine(dgpp::net::CollectiveBus* bus, int rank,
                                                       int world_, uint16_t* pick_scratch,

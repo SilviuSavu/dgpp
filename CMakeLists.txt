@@ -331,7 +331,8 @@ dgpp_set_common(dgpp_models_mimo_layers)
 # The full GLM-5.3 model on the session core (docs/glm53_plan.md G5).
 add_library(dgpp_models_glm_dsa_layers STATIC
   src/models/glm_dsa/model.cpp
-  src/models/glm_dsa/dflash2.cpp)
+  src/models/glm_dsa/dflash2.cpp
+  src/models/glm_dsa/dflash2_model.cpp)
 target_include_directories(dgpp_models_glm_dsa_layers PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(dgpp_models_glm_dsa_layers
   PUBLIC dgpp_models_glm_dsa dgpp_models_glm_dsa_loader dgpp_models_dsa dgpp_models_moe dgpp_models_glm dgpp_kernels CUDA::cudart)
