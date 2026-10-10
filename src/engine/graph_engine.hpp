@@ -732,7 +732,9 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
         throw std::logic_error("graph engine: configure_block_rows_budget after a capture");
     if (budget < 0) throw std::invalid_argument("graph engine: the block rows budget must be >= 0");
     block_rows_budget_ = 0;
-    if (!block_ || budget == 0 || families_.empty()) return;
+    if (!block_ || budget == 0) return;
+    if (families_.empty() && !batch_unavailable_)
+      return;  // neither world: nothing to size
     if (schedule_)
       throw std::invalid_argument("engine.dflash_batch_rows and engine.mtp_schedule are exclusive (the schedule sets the rows)");
     // The depth options: every family's rows under the budget, and the full block.
@@ -741,6 +743,8 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
       const int rows = std::max(2, std::min(rows_per_request_, budget / std::max(1, f.requests)));
       depths.push_back(rows - 1);
     }
+    if (families_.empty())
+      depths.push_back(std::max(2, std::min(rows_per_request_, budget)) - 1);  // the scalar slot's own option
     depths.push_back(depth_);
     std::sort(depths.begin(), depths.end());
     depths.erase(std::unique(depths.begin(), depths.end()), depths.end());
@@ -3289,6 +3293,14 @@ class GraphEngineAdapter final : public sched::SchedulerEngine {
     int rows = rows_per_request_;
     if (schedule_ && spec_enabled()) {
       di = choose_depth_option(req);
+      rows = 1 + depth_options_[static_cast<size_t>(di)];
+      if (di < full_depth_option()) ensure_sched_graph(req, di);
+      ++sched_hist_[static_cast<size_t>(di)];
+    } else if (block_ && block_rows_budget_ > 0 && !depth_options_.empty()) {
+      // The rows budget's static depth (the scalar block world: GLM-5.3-Flash
+      // holds ONE eight-row block per decode batch, so the budget sizes the
+      // single slot's verify the same way a family's).
+      di = block_depth_option(1);
       rows = 1 + depth_options_[static_cast<size_t>(di)];
       if (di < full_depth_option()) ensure_sched_graph(req, di);
       ++sched_hist_[static_cast<size_t>(di)];
