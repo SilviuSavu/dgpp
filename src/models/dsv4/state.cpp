@@ -188,6 +188,23 @@ void Dsv4StatePool::reset_all(cudaStream_t stream) {
   table_.reset_all(stream);
 }
 
+std::vector<CachePlane> Dsv4StatePool::planes() const {
+  // The same regions copy_block_contents walks, one plane per cache (its
+  // main rows and, when indexed, its index keys and scales), each with a
+  // block's bytes: entries_per_block rows of kRowBytes at ratio r.
+  std::vector<CachePlane> out;
+  if (!initialized_) return out;
+  for (int o = 0; o < caches(); ++o) {
+    const size_t i = static_cast<size_t>(o);
+    const size_t epb = static_cast<size_t>(entries_per_block(o));
+    out.push_back({main_[i], epb * kRowBytes});
+    if (!indexed(o)) continue;
+    out.push_back({index_k_[i], epb * kDsv4IndexDim});
+    out.push_back({reinterpret_cast<uint8_t*>(index_scale_[i]), epb * sizeof(float)});
+  }
+  return out;
+}
+
 void Dsv4StatePool::copy_block_contents(int32_t src, int32_t dst, cudaStream_t stream) {
   table_.check_block(src);
   table_.check_block(dst);

@@ -17,6 +17,14 @@ The entry floor and the head cut (2026-09-28) are covered by `scheduler_test`
 (`entryFloorKeepsShortPromptsOutOfTheArena`, `headCutServesTheNextConversation…`,
 `headCutYieldsToTheDeepestCutWhenSlotsAreScarce`, `headCutThroughChunkedPrefill`),
 `cluster_config_test` (the keys) and `fabric_serve_test` (the journal records).
+The NVMe cold tier (issue #26) is covered by `unit_tests` (the disk index:
+page allocation, block sharing, LRU retention, aborts), `scheduler_test`'s
+`nvmeCache` cases (spill, evict, restore and attach; failed restores and
+spills; retention; two requests on one restore; a cancel while restoring;
+identical op streams and digests), `fabric_serve_test` (the journal's return
+path, the commit collector, and ok 10: the flow across three ranks over real
+sockets) and `qwen_decode_test`'s tier block (spill and restore bitwise on
+the fixture, attach parity, a corrupted page detected).
 The [fabric record](../benchmarks/results/2026-09-21-prefix-document-reuse.md)
 covers real 32K/260K prompts, KV sharing and the recipe memory-plan audit.
 

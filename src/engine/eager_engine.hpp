@@ -27,6 +27,7 @@
 #include "common/log.hpp"
 #include "engine/decode_outputs.hpp"
 #include "engine/image_prefill.hpp"
+#include "engine/nvme_tier.hpp"
 #include "engine/prefix_arena.hpp"
 #include "sample/sampler.hpp"
 #include "sched/scheduler.hpp"
@@ -245,6 +246,37 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
     st.attach_ms = arena_.attach_ms();
     st.snapshot_bytes = static_cast<int64_t>(arena_.bytes());
     return st;
+  }
+
+  // ---- the NVMe cold tier (issue #26) --------------------------------------
+  void disk_enable(const sched::SchedulerEngine::DiskEnable& enable) override {
+    if (tier_) throw std::logic_error("generation engine: the cold tier is already open");
+    if (arena_.slots() <= 0) throw std::invalid_argument("generation engine: the cold tier needs a prefix arena");
+    tier_ = std::make_unique<NvmeTier<Model>>(model_, &arena_, enable);
+  }
+  sched::SchedulerEngine::DiskInfo disk_info() const override {
+    return tier_ ? tier_->info() : sched::SchedulerEngine::DiskInfo{};
+  }
+  sched::SchedulerEngine::DiskBlocks disk_entry_blocks(int slot) const override {
+    if (!tier_) throw std::logic_error("generation engine: no cold tier");
+    return tier_->entry_blocks(slot);
+  }
+  void disk_spill_begin(const sched::SchedulerEngine::DiskSpill& spill) override {
+    if (!tier_) throw std::logic_error("generation engine: no cold tier");
+    tier_->spill_begin(spill);
+  }
+  sched::SchedulerEngine::DiskBlocks disk_restore_begin(const sched::SchedulerEngine::DiskRestore& restore) override {
+    if (!tier_) throw std::logic_error("generation engine: no cold tier");
+    return tier_->restore_begin(restore);
+  }
+  void disk_pump() override {
+    if (tier_) tier_->pump();
+  }
+  std::vector<sched::SchedulerEngine::DiskCompletion> disk_poll() override {
+    return tier_ ? tier_->poll() : std::vector<sched::SchedulerEngine::DiskCompletion>{};
+  }
+  sched::SchedulerEngine::DiskEngineStats disk_engine_stats() const override {
+    return tier_ ? tier_->stats() : sched::SchedulerEngine::DiskEngineStats{};
   }
   void reserve(int req, int64_t tokens) override {
     model_->session_reserve_blocks(req, tokens);
@@ -540,6 +572,7 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
   std::vector<int64_t> pending_;
   std::vector<SlotState> state_;
   PrefixArena<Model> arena_;  // the prefix cache's snapshot slots (M7)
+
   // DFlash2 drafter drivers, one per slot (only used when the model has a
   // drafter; eager greedy semantics, exact under greedy verify).
   std::vector<std::unique_ptr<DFlash2Speculator<Model>>> spec_;
@@ -688,6 +721,8 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
       return w;
     };
   }
+
+  std::unique_ptr<NvmeTier<Model>> tier_;  // the NVMe cold tier (issue #26); after the arena
 };
 
 // The world-1 pick: full-vocab argmax over the fp32 logits row. The closure

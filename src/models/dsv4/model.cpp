@@ -63,7 +63,21 @@ Dsv4PoolShape Dsv4Model::pool_shape(const Dsv4Config& cfg, int max_requests, int
   return s;
 }
 
-// ---------------------------------------------------------------------------
+size_t Dsv4Model::kv_block_bytes_static(const Dsv4Config& cfg) {
+  // The pool's planes (Dsv4StatePool::planes): one main plane per cache
+  // ordinal, its index keys and scales when indexed — 128 tokens of rows
+  // at ratio r hold 128 / r entries.
+  size_t total = 0;
+  for (int l = 0; l < cfg.max_layer(); ++l) {
+    const int r = cfg.compress_ratio(l);
+    if (r <= 0) continue;
+    const size_t epb = static_cast<size_t>(kBlockTokens) / static_cast<size_t>(r);
+    total += epb * Dsv4StatePool::kRowBytes;
+    if (r == 4) total += epb * (kDsv4IndexDim + sizeof(float));
+  }
+  return total;
+}
+
 // Construction.
 // ---------------------------------------------------------------------------
 Dsv4Model::Dsv4Model(const Dsv4Config& cfg, const std::string& checkpoint_dir, int max_tokens,

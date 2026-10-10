@@ -139,6 +139,27 @@ void Qwen35KvPool::reset_all(cudaStream_t stream) {
   table_.reset_all(stream);
 }
 
+std::vector<CachePlane> Qwen35KvPool::planes() const {
+  // The same regions copy_block_contents walks: one K and one V plane per
+  // full layer, plus the drafter's own planes over the same block table.
+  std::vector<CachePlane> out;
+  if (!initialized_) return out;
+  const size_t blk = static_cast<size_t>(shape_.block_tokens) * kv_row_elems() * sizeof(uint16_t);
+  for (int l = 0; l < shape_.layers; ++l) {
+    const size_t base = static_cast<size_t>(l) * layer_kv_elems();
+    out.push_back({reinterpret_cast<uint8_t*>(k_base_ + base), blk});
+    out.push_back({reinterpret_cast<uint8_t*>(v_base_ + base), blk});
+  }
+  if (dk_base_) {
+    const size_t dblk = static_cast<size_t>(shape_.block_tokens) * draft_row_elems() * sizeof(uint16_t);
+    for (int l = 0; l < shape_.draft_layers; ++l) {
+      const size_t base = static_cast<size_t>(l) * draft_layer_kv_elems();
+      out.push_back({reinterpret_cast<uint8_t*>(dk_base_ + base), dblk});
+      out.push_back({reinterpret_cast<uint8_t*>(dv_base_ + base), dblk});
+    }
+  }
+  return out;
+}
 void Qwen35KvPool::copy_block_contents(int32_t src, int32_t dst, cudaStream_t stream) {
   if (src < 0 || src >= total_blocks() || dst < 0 || dst >= total_blocks())
     throw std::out_of_range("Qwen35KvPool: block out of range in copy_block_contents");
@@ -908,6 +929,26 @@ void Qwen35Model::dense_mlp(const uint16_t* x, uint16_t* out, int tokens,
   // this matrix at ~215 GB/s against the GEMV's 240 — a kernel item).
   launch_scale_gemm_bf16(gate_tmp_, static_cast<size_t>(I), m.down_fp8.payload, m.down_fp8.scales, out,
                          tokens, static_cast<int>(H), static_cast<int>(I), stream, 0, gw_.mma_from_rows);
+}
+size_t Qwen35Model::kv_block_bytes_static(const Qwen35TextConfig& cfg, int world, bool mtp,
+                                          const std::string& dflash2_dir) {
+  const LoaderHeadSharding head =
+      world > 1 ? LoaderHeadSharding::VocabSharded : LoaderHeadSharding::Full;
+  int layers = 0;
+  for (Qwen35LayerKind k : cfg.layers)
+    if (k != Qwen35LayerKind::Gdn) ++layers;
+  if (mtp) ++layers;  // the draft plane
+  std::unique_ptr<DFlash2Config> dfcfg;
+  if (!dflash2_dir.empty()) dfcfg = std::make_unique<DFlash2Config>(DFlash2Config::from_json_file(
+      dflash2_dir + "/config.json"));
+  const size_t kv_row =
+      static_cast<size_t>(Qwen35LocalGeometry::from_config(cfg, 0, world, head).local_kv_heads) * cfg.head_dim;
+  size_t blk = static_cast<size_t>(kv_block_tokens_static()) * kv_row * 2 * 2;  // K + V, bf16
+  if (dfcfg) {
+    const size_t drow = static_cast<size_t>(dfcfg->local_kv_heads(world)) * dfcfg->head_dim;
+    blk += static_cast<size_t>(kv_block_tokens_static()) * drow * 2 * 2;
+  }
+  return static_cast<size_t>(layers) * blk;
 }
 
 size_t Qwen35Model::session_snapshot_bytes(const Qwen35TextConfig& cfg, int world, bool mtp) {

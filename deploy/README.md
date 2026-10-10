@@ -34,7 +34,11 @@ cache budget that measured at or above every other shape tried — except the
 Qwen3.8-27B templates, which name `engine.dflash_model` instead of MTP: the
 external block drafter replacing the MTP draft (the block proposal
 recorded inside the graph step at every world; one Spark without the
-decode graph runs it on the eager engine). The shapes
+decode graph runs it on the eager engine). The long-context templates also
+carry a top-level `nvme_cache` block, off by default: set `enabled` to
+true and size `capacity_gib` to the node's free NVMe to keep evicted
+prefix entries on disk (the [README](../README.md#nvme-cache) lists the
+keys; startup checks the space). The shapes
 a template does not name are knobs appended at boot:
 `scripts/dgpp-cluster up --config FILE --knobs "FLAGS"`.
 
