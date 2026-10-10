@@ -62,6 +62,21 @@ before increasing capacity, and measure tokens per step as well as step
 latency. [Operations](operations.md) describes the depth tradeoff, and
 [benchmarks](benchmarks.md) records the results for each model.
 
+## The DFlash2 block drafter on the GLM lanes
+
+The full GLM-5.3 lane (models/glm_dsa/dflash2.*) and the GLM-5.3-Flash
+lane (models/glm/dflash2.*, 2026-10-10) share the drafter's kernels and
+checkpoint format. The Flash port's specifics: the tap capture rides the
+mHC walk (each tap boundary's four streams through the head's mean — the
+reference recipe's documented contraction; the split-prefill deferred
+seam lands the pending tap after block B's update), the planes are the
+shared DFlash2Planes, and the eight-row decode batch holds exactly one
+block — the recorded draft is the scalar step's, and
+`engine.dflash_batch_rows: 4` caps the verify at the family's
+row-invariant bound so committed tokens are bitwise the plain path's
+(the whole block verifies different bits past four rows on this family;
+the Qwen lane's row-invariance work is the follow-up).
+
 ## The DFlash2 block drafter (Qwen3.8-27B)
 
 DFlash2 (`src/models/qwen/dflash2.hpp`, `src/kernels/dflash2.cu`) replaces

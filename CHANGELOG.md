@@ -6,6 +6,34 @@ The history by milestone. The dated engineering record in
 
 ## Unreleased
 
+- **Serve GLM-5.3-Flash with the DFlash2 block drafter** (2026-10-10):
+  the second GLM lane of the drafter (after the full GLM-5.3 port), on the
+  NVFP4-FP8 hybrid at four Sparks. The drafter
+  (`incoai/GLM-5.3-Flash-DFlash2`, five bidirectional layers, taps
+  [5,14,24,33,42]) feeds off the Flash walk's tap boundaries: each tap
+  layer's mHC streams contract through the head's mean (the reference's
+  hc_post materialization — the recipe's documented silent-acceptance
+  hazard), accumulate through the split fc, and land as the draft layers'
+  K/V in dedicated window planes (the planes moved to
+  models/qwen/dflash2.hpp as DFlash2Planes). Every walk feeds the planes —
+  prefill chunks, the split-prefill deferred seam included, decode rows,
+  rejected verify rows masked by position. This family caps at eight
+  decode rows, so one 8-row block IS the whole batch: the recorded draft
+  is the scalar step's (no batch family), and the eager stacked redraft
+  stays single-slot. Gates on the fabric: greedy transcripts IDENTICAL to
+  the plain path 4/4 classes at the shipped recipe, acceptance p1 94 /
+  p2 88 / p3 79 %, 3.59 tok/step at 43.1 ms (~83 tok/s C1 instantaneous);
+  per-class walls 1.35-2.00x plain and 1.00-1.31x the MTP-1 template —
+  the §7 exit gate holds (level on chat, ahead on code/JSON/math). The
+  whole-block 8-row verify reads DIFFERENT from plain: this family's
+  decode kernels are not row-invariant past the four-row GEMM bound (the
+  Qwen lane's 2026-10-05 row-invariance campaign never landed here;
+  MTP-1's 2-row verify IS identical, which isolates the cause), so
+  `engine.dflash_batch_rows: 4` pins the exact recipe — the budget now
+  also sizes the single-slot verify when no batch family exists (the
+  scalar block world), and its depth options gain the scalar slot's own.
+  The row-expansion campaign (PLAN's GLM-Flash item) is the recorded
+  follow-up that unlocks the full 7-draft block.
 - **The L2 weight prefetcher's knobs are engine keys** (2026-10-05):
   `engine.l2_prefetch` (on/off), `engine.l2_prefetch_form` (`load` the
   bytes, `lines` one L2 prefetch per 128-byte line, `touch` one line per
