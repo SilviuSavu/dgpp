@@ -32,3 +32,18 @@ per rank with 0.47 GiB companions + 0.14 GiB planes/scratch.
 
 ab_plain.json / ab_mtp1.json / ab_d4.json / ab_final.json — the gate
 transcripts and walls per class.
+
+## Depth 7 (the same day)
+
+The whole-block divergence was dispatch, not kernels: the GEMV chunks and
+the fp8 core are row-invariant through eight rows by design, and the Flash
+model routed rows 5-8 into cuBLASLt/MMA (`set_decode_rows(4)`,
+`gemm_mma_from_rows 5`). With the decode bounds past the whole batch:
+
+- whole block (`--dflash-batch-rows 0`): transcripts IDENTICAL 4/4,
+  5.17 tok/step at 62.4 ms, accept p1 93 / p2 80 / p3 64 / p4 58 /
+  p5 52 / p6 45 / p7 34
+- the four-row recipe stays the shipped default (same ~83 tok/s
+  instantaneous; its shorter step wins chat 4.8 s vs 6.4 s and code
+  4.2 vs 4.5, the block wins json 2.8 vs 3.2 and math 3.4 vs 3.5)
+- ab_block.json / ab_plain2.json / ab_final2.json: the depth-7 gates

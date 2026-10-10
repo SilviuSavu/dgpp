@@ -121,9 +121,16 @@ GlmDiagnosticModel::GlmDiagnosticModel(const GlmTextConfig& cfg, const std::stri
   // The dense sites' lowering (kernels/gemm.hpp dense_gemv_rows): the GEMV
   // chunks to the bound, cuBLASLt's algorithm (bf16) or the streaming
   // tensor-core GEMM (fp8: the DSA projections, the dense MLP) above it.
-  dsa_cfg_.gemm_mma_from_rows = dense_gemv_rows() + 1;
-  dense_mma_from_rows_ = dense_gemv_rows() + 1;
-  gemm_.set_decode_rows(std::min(kDecodeRows, dense_gemv_rows()));
+  // The whole decode batch keeps the row-independent chains (the DFlash2
+  // block verifies eight rows — the spec rows' bits must be the T = 1
+  // bits): the bf16 chunks and the fp8 GEMV core cover 1..8, so the
+  // decode bounds sit past the batch instead of at dense_gemv_rows(),
+  // and a 5..8-row prefill tail chunk takes the chunks too (its Lt
+  // algorithm was the old chain — deterministic either way, and every
+  // lane on one build shares the new one).
+  dsa_cfg_.gemm_mma_from_rows = kDecodeRows + 1;
+  dense_mma_from_rows_ = kDecodeRows + 1;
+  gemm_.set_decode_rows(kDecodeRows);
   DsaConfig::validate_config(dsa_cfg_);
   if (max_cache_tokens < max_tokens_)
     max_cache_tokens = max_tokens_;

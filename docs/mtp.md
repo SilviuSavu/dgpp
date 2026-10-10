@@ -72,10 +72,12 @@ reference recipe's documented contraction; the split-prefill deferred
 seam lands the pending tap after block B's update), the planes are the
 shared DFlash2Planes, and the eight-row decode batch holds exactly one
 block — the recorded draft is the scalar step's, and
-`engine.dflash_batch_rows: 4` caps the verify at the family's
-row-invariant bound so committed tokens are bitwise the plain path's
-(the whole block verifies different bits past four rows on this family;
-the Qwen lane's row-invariance work is the follow-up).
+the decode bounds cover the whole eight-row batch (the GEMV chunks and
+the fp8 core are row-invariant through eight rows once
+`set_decode_rows`/`gemm_mma_from_rows` sit past it), so BOTH the capped
+(`engine.dflash_batch_rows: 4`, the shipped default — the shorter step
+wins chat/code) and the whole 7-draft block verify bitwise the plain
+path's.
 
 ## The DFlash2 block drafter (Qwen3.8-27B)
 

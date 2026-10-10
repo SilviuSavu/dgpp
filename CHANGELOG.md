@@ -32,8 +32,23 @@ The history by milestone. The dated engineering record in
   `engine.dflash_batch_rows: 4` pins the exact recipe — the budget now
   also sizes the single-slot verify when no batch family exists (the
   scalar block world), and its depth options gain the scalar slot's own.
-  The row-expansion campaign (PLAN's GLM-Flash item) is the recorded
-  follow-up that unlocks the full 7-draft block.
+  The row-invariance gap closed the same day, and it was dispatch, not
+  kernels: the GEMV chunks and the fp8 core are row-invariant through
+  eight rows by design — the Flash model routed rows 5-8 away from them
+  (`set_decode_rows(min(8, dense_gemv_rows()))`, `gemm_mma_from_rows 5`)
+  into cuBLASLt/MMA chains. Holding the decode bounds past the whole
+  batch makes the full 7-draft block bit-exact too: transcripts
+  identical 4/4 at `--dflash-batch-rows 0`, 5.17 tok/step at 62.4 ms
+  (p1 93 / p2 80 / p3 64 / p4 58 / p5 52 / p6 45 / p7 34) — the same
+  ~83 tok/s instantaneous as the 4-row recipe, whose shorter step wins
+  the per-class walls on chat/code (the reasoning stream's tail
+  acceptance is thin) while the block wins json/math. The template
+  ships `dflash_batch_rows: 4`; the whole block is one flag away and
+  exact. A 5-8-row prefill tail chunk now takes the chunks instead of
+  its old Lt algorithm (deterministic; every lane on one build shares
+  the chain). The confidence-scheduled depth (the selector's confidence
+  is published) is the follow-up that would pick the shallow chat steps
+  and the deep json steps per request.
 - **The L2 weight prefetcher's knobs are engine keys** (2026-10-05):
   `engine.l2_prefetch` (on/off), `engine.l2_prefetch_form` (`load` the
   bytes, `lines` one L2 prefetch per 128-byte line, `touch` one line per
