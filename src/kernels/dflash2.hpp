@@ -32,6 +32,13 @@ void dflash2_grouped_conv_bf16(const uint16_t* x, const uint16_t* delta, const u
                                uint16_t* out, int rows, int block_rows, int hidden, int taps,
                                int group_size, int64_t delta_row_stride, cudaStream_t stream);
 
+// Plain bf16 embedding-row gather for the drafter's block inputs: row r
+// copies embed[tokens[r], :] to dst[r, :] — a full (replicated) embedding
+// table, so no boundary fold at any world. Tokens outside [0, vocab) are a
+// caller contract (the drafter stages ids or the mask token).
+void dflash2_embed_rows(const uint16_t* embed, const int64_t* tokens, uint16_t* dst,
+                        int64_t vocab, int rows, int hidden, cudaStream_t stream);
+
 // out += src (fp32, elementwise, fixed order). beta 0: out = src. The
 // per-tap fc accumulation: the fused target features
 // sum_t tap_t @ fc_t^T computed as one fp32 GEMM per tap layer.

@@ -28,10 +28,12 @@
 #include "engine/decode_outputs.hpp"
 #include "kernels/bf12_companions.hpp"
 #include "kernels/gemm.hpp"
+#include "kernels/sample_pick.hpp"
 #include "kernels/glm_spec.hpp"
 #include "kernels/l2_prefetch.hpp"
 #include "models/dsa_layer.hpp"
 #include "models/dsa_state.hpp"
+#include "models/glm/dflash2.hpp"
 #include "models/glm/loader.hpp"
 #include "models/glm/moe_layer.hpp"
 #include "models/glm/trace.hpp"
@@ -104,7 +106,8 @@ class GlmDiagnosticModel : public PrefillReporting {
                      GlmResidency residency = GlmResidency::Streaming,
                      GlmHeadSharding head = GlmHeadSharding::Full, int max_requests = 1,
                      bool mtp = false, LatentFormat kv_format = LatentFormat::kBf16,
-                     bool serving_logits = false);
+                     bool serving_logits = false,
+                     const std::string& dflash2_dir = "");
 
   // ---- the memory plan ----------------------------------------
   // Every byte the constructor (and its layer objects) will allocate for a
@@ -125,7 +128,8 @@ class GlmDiagnosticModel : public PrefillReporting {
                                 GlmResidency residency = GlmResidency::Streaming,
                                 GlmHeadSharding head = GlmHeadSharding::Full, int max_requests = 1,
                                 bool mtp = false, LatentFormat kv_format = LatentFormat::kBf16,
-                                bool serving_logits = false);
+                                bool serving_logits = false,
+                                const std::string& dflash2_dir = "");
   ~GlmDiagnosticModel();
   GlmDiagnosticModel(const GlmDiagnosticModel&) = delete;
   GlmDiagnosticModel& operator=(const GlmDiagnosticModel&) = delete;
@@ -397,6 +401,86 @@ class GlmDiagnosticModel : public PrefillReporting {
   // bitwise group-vs-solo gate reads (tests/cuda/glm_tp_test.cpp).
   void set_walk_capture(std::vector<std::vector<uint16_t>>* capture) { walk_capture_ = capture; }
   int64_t session_position(int req) const;
+
+
+  // engine.dflash_weights (checkpoint | fp8): the drafter's five block
+  // matrices stream as E4M3 payloads with fp32 block-128 scales instead of
+  // bf16 (the Qwen lane's recipe; lossy for the proposals only — the
+  // verify is exact whatever the drafter proposes). Set before
+  // construction, like GlmDsaModel::set_dflash2_weights_fp8.
+  static void set_dflash2_weights_fp8(bool on) { dflash2_fp8_ = on; }
+
+  // ---- the DFlash2 drafter (models/glm/dflash2.*) -------------------------
+  // Every walk (prefill chunk, decode rows, verify rows, captured graphs)
+  // also feeds the drafter: the tap layers' boundary mHC streams contract
+  // through the head's mean (the reference's hc_contract), accumulate
+  // through the split fc, and land as each draft layer's K/V in the
+  // drafter's own window planes at the walk's positions (rejected verify
+  // rows land too and are masked by position — the planes need no
+  // rollback). dflash2_draft runs the block [anchor, mask x drafts]
+  // through the bidirectional layers over the plane context; each mask
+  // row's top-K goes through the reference chained selector walk, which
+  // proposes the following `drafts()` tokens. The scalar step's recorded
+  // form lands the same block forward inside the replay off the device
+  // verdict, feeding the next replay's rows and the drafts' pinned
+  // mirror. Public: the engines bind the drafter through requires-probes
+  // on these.
+  bool dflash2_enabled() const { return dflash2_; }
+  int dflash2_drafts() const { return dflash2_ ? dfcfg_.drafts() : 0; }
+  bool dflash_verify_graph() const { return false; }
+  bool dflash_graph_verify_available() const { return false; }
+  bool dflash_draft_batch() const { return dflash2_ && df_batch_ > 1; }
+  int dflash_depth() const { return -1; }
+  // False without a draft (the context bound): the caller runs the step
+  // without speculation.
+  bool dflash2_draft(int req, int64_t bonus, std::vector<int32_t>* drafts);
+  // The stacked redraft (this family's eight-row batch holds ONE block, so
+  // the stacked form stays single-slot — kept for the engine's contract).
+  void dflash2_draft_batch(const std::vector<int>& reqs, const std::vector<int64_t>& bonuses,
+                           std::vector<std::vector<int32_t>>* drafts);
+  int dflash2_batch_slots() const { return df_batch_; }
+  // The recorded block draft (the scalar step's block proposal): off the
+  // verify's device verdict — the anchor is its next token, the block's
+  // positions follow the committed device position — the block forward,
+  // the mask rows' head rows and their top-K (world>1: the ranks' slice
+  // lists merged through one boundary fold), the selector walk, the
+  // slot's next feed [next, drafts] and the drafts' pinned mirror.
+  // Kernel nodes only.
+  void session_graph_capture_block_draft(int req, const PickVerdict* verdict);
+  // The sampled requests' block proposals (the engine's draft rule): the
+  // recorded walk draws each draft from the selector's softmax at the
+  // request's draft temperature and writes the set it drew from to
+  // proposals[req * stride + l] (and the pinned mirror), the next verify's
+  // ratio rule; a greedy request keeps the argmax and n = 0. `specs` is
+  // the engine's device SampleSpec table (one per slot). Null specs: the
+  // argmax walk, no proposals. Before the first capture.
+  void dflash2_arm_proposals(const SampleSpec* specs, DraftProposal* proposals,
+                             DraftProposal* proposals_host, int stride) {
+    if (specs != nullptr && (proposals == nullptr || stride < dfcfg_.drafts()))
+      throw std::invalid_argument("dflash2_arm_proposals: proposals / stride");
+    df_specs_ = specs;
+    df_props_ = proposals;
+    df_props_h_ = proposals_host;
+    df_props_stride_ = stride;
+  }
+  bool dflash2_proposals_armed() const { return df_specs_ != nullptr; }
+  // The selector's confidence per draft, [max_requests][drafts] written by
+  // every walk (recorded or eager) at the slot's row — the scheduled
+  // verify depth's input for the block drafter (engine.mtp_schedule).
+  const float* dflash2_confidence() const { return df_conf_; }
+  // The mirror the recorded draft of slot `req` publishes (readable once
+  // the replay's end event has passed).
+  const int32_t* block_drafts_host(int req) const {
+    return df_mirror_h_ + static_cast<size_t>(req) * static_cast<size_t>(dfcfg_.drafts());
+  }
+  // The mask rows' top-k candidate ids the recorded draft walked
+  // ([drafts][block_candidates()] per slot; the engine's acceptance
+  // diagnostics rank the verify's correction among them).
+  int block_candidates() const { return dfcfg_.selector_top_k; }
+  const int32_t* block_candidates_host(int req) const {
+    return df_cands_h_ + static_cast<size_t>(req) * static_cast<size_t>(dfcfg_.drafts()) *
+                         static_cast<size_t>(dfcfg_.selector_top_k);
+  }
 
   // ---- the graph era (DESIGN §6.2, the decode step) --------------------
   // The decode step is a fixed launch sequence, so it records ONCE into
@@ -885,6 +969,63 @@ class GlmDiagnosticModel : public PrefillReporting {
                     const uint16_t* const* layer_inputs,
                     std::vector<std::vector<uint16_t>>* capture,
                     std::vector<std::vector<uint16_t>>* boundary_capture);
+
+  // ---- the DFlash2 drafter (models/glm/dflash2_model.cpp) ----
+  void dflash2_init(const std::string& dflash2_dir);
+  // One tap layer's capture point in the walk (decode.cpp): the boundary
+  // streams through the contraction, the fc slice, the accumulator.
+  void dflash2_capture_tap(int layer, const uint16_t* streams, int T);
+  void dflash2_store_features(int T, const int32_t* d_req, const int64_t* d_pos);
+  // The prefill/group walk's per-row sources (decode walks read the
+  // session's device metadata instead).
+  void dflash2_store_walk(int req, int64_t token_start, int T);
+  void df_block_layers(int slots, const int* reqs, bool capture);
+  void df_block_select(int slots, const int* reqs, bool capture);
+  inline static bool dflash2_fp8_ = false;  // set_dflash2_weights_fp8
+  bool dflash2_ = false;
+  DFlash2Config dfcfg_;
+  DFlash2Weights dfw_;
+  std::vector<int> df_tap_;
+  DFlash2Planes df_planes_;
+  int df_nh_ = 0, df_kvh_ = 0, df_qw_ = 0, df_kvr_ = 0, df_i_ = 0;
+  float* df_inv_freq_ = nullptr;
+  float *df_acc_ = nullptr, *df_t32_ = nullptr;
+  uint16_t* df_collapsed_ = nullptr;  // [max_tokens, H] the tap contraction
+  uint16_t *df_norm_ = nullptr, *df_kv_ = nullptr;
+  uint16_t *df_resid_ = nullptr, *df_x_ = nullptr, *df_xc_ = nullptr, *df_qkv_ = nullptr;
+  uint16_t *df_q_ = nullptr, *df_attn_ = nullptr, *df_o_ = nullptr, *df_mlp_ = nullptr;
+  uint16_t *df_gate_ = nullptr, *df_up_ = nullptr, *df_h_ = nullptr;
+  uint16_t* df_table_ = nullptr;
+  float* df_attn_part_ = nullptr;
+  int32_t* df_zero_ = nullptr;
+  uint16_t* df_delta_ = nullptr;
+  float* df_logits_ = nullptr;
+  void* df_topk_ws_ = nullptr;
+  size_t df_topk_ws_bytes_ = 0;
+  float* df_hidden32_ = nullptr;
+  int32_t *df_ids_ = nullptr, *df_tok_ = nullptr, *df_tok_h_ = nullptr;
+  float* df_sc_ = nullptr;
+  float* df_conf_ = nullptr;
+  int64_t *df_pos_ = nullptr, *df_tokens_ = nullptr, *df_io64_h_ = nullptr;
+  int32_t* df_walk_req_ = nullptr;
+  int64_t* df_walk_pos_ = nullptr;
+  int32_t* df_walk_req_h_ = nullptr;
+  int64_t* df_walk_pos_h_ = nullptr;
+  // The stacked draft batch's slots per block forward (this family's
+  // eight-row decode batch holds exactly one eight-row block: 1).
+  int df_batch_ = 1;
+  // The recorded drafts' pinned mirrors (read after the replay's end
+  // event) and the engine's armed sampled-proposal tables.
+  int32_t* df_mirror_h_ = nullptr;
+  int32_t* df_cands_h_ = nullptr;
+  const SampleSpec* df_specs_ = nullptr;
+  DraftProposal* df_props_ = nullptr;
+  DraftProposal* df_props_h_ = nullptr;
+  int df_props_stride_ = 0;
+  // The split-prefill walk's deferred tap (the seam completes the layer's
+  // block B before the boundary streams are whole; -1 = none pending).
+  int df_pending_tap_ = -1;
+  static constexpr int df_rows_cap() { return 2048; }
 
   GlmTextConfig cfg_;
   KdaConfig kda_cfg_;

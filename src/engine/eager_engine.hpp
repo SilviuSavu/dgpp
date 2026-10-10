@@ -368,8 +368,12 @@ class EagerEngineAdapter : public sched::SchedulerEngine {
           outs = model_->session_verify_batch_graph(reqs, feds, &offs);
         else
           throw std::logic_error("eager engine: dflash_verify_graph without the captured verify");
-      } else {
+      } else if constexpr (requires { model_->session_verify_batch(reqs, feds, &offs); }) {
         outs = model_->session_verify_batch(reqs, feds, &offs);
+      } else {
+        // Families without the eager batched verify (GLM-5.3-Flash: its
+        // multi-slot decode is the graph engine's scalar replays).
+        throw std::logic_error("eager engine: this family serves the block drafter's multi-slot step on the decode graph");
       }
       const long long ph2 = ph ? ns_now() : 0;
       std::vector<std::vector<int32_t>> out(reqs.size());

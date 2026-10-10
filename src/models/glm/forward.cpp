@@ -1,4 +1,7 @@
+#include "kernels/dflash2.hpp"
+#include "models/glm/dflash2.hpp"
 #include "models/glm/forward.hpp"
+#include "models/qwen/dflash2.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -89,7 +92,8 @@ GlmDiagnosticModel::GlmDiagnosticModel(const GlmTextConfig& cfg, const std::stri
                                        GlmBoundaryReducer* boundary, int tp_rank, int tp_world,
                                        GlmResidency residency, GlmHeadSharding head,
                                        int max_requests, bool mtp, LatentFormat kv_format,
-                                       bool serving_logits)
+                                       bool serving_logits,
+                                       const std::string& dflash2_dir)
     : cfg_(cfg),
       kda_cfg_(with_tp(cfg.kda_config(), tp_world)),
       dsa_cfg_(with_tp(cfg.dsa_config(), tp_world)),
@@ -391,6 +395,11 @@ GlmDiagnosticModel::GlmDiagnosticModel(const GlmTextConfig& cfg, const std::stri
                              sizeof(uint64_t), cudaHostAllocDefault));
   *h_graph_start_gt_ = 0;
 
+  // The DFlash2 drafter (models/glm/dflash2_model.cpp): loaded after every
+  // model allocation, before the layer loads (its bf12 companions pack
+  // ahead of the layers' own, and finish_companions reserves after both).
+  if (!dflash2_dir.empty()) dflash2_init(dflash2_dir);
+
   // Every device allocation happens above (see preconstruct_layers): the
   // TP runners barrier after construction so no rank's first collective
   // can spin while a peer is still inside allocation-phase device syncs.
@@ -471,7 +480,8 @@ size_t GlmDiagnosticModel::kv_block_bytes_static(const GlmTextConfig& cfg, int t
 GlmDiagnosticModel::MemoryPlan GlmDiagnosticModel::plan_memory(
     const GlmTextConfig& cfg, int max_tokens, int64_t max_cache_tokens, int tp_rank, int tp_world,
     GlmResidency residency, GlmHeadSharding head, int max_requests, bool mtp,
-    LatentFormat kv_format, bool serving_logits) {
+    LatentFormat kv_format, bool serving_logits,
+    const std::string& dflash2_dir) {
   if (max_tokens <= 0)
     throw std::invalid_argument("plan_memory: max_tokens must be positive");
   if (max_requests <= 0)
@@ -551,6 +561,76 @@ GlmDiagnosticModel::MemoryPlan GlmDiagnosticModel::plan_memory(
                         Hh * static_cast<size_t>(kda_geo.local_proj) * 2, mtp ? Hh * 2 * Hh * 2 : 0,
                         V * Hh * 2}));
     }
+  }
+  std::unique_ptr<DFlash2Config> dfcfg;
+  if (!dflash2_dir.empty()) {
+    if (mtp)
+      throw std::invalid_argument("plan_memory: the DFlash2 drafter replaces the MTP draft; enable one or the other");
+    dfcfg = std::make_unique<DFlash2Config>(DFlash2Config::from_json_file(dflash2_dir + "/config.json"));
+    dflash2_validate_against(*dfcfg, cfg);
+    if (!dfcfg->tp_divisible(tp_world))
+      throw std::invalid_argument(
+          "plan_memory: the DFlash2 drafter's heads / kv heads / MLP rows must divide across the world");
+  }
+  if (dfcfg) {
+    const size_t M = static_cast<size_t>(max_tokens);
+    plan.add(dflash2_fp8_ ? "dflash2 drafter weights (this rank's slices; the block matrices as fp8, the rest bf16)"
+                          : "dflash2 drafter weights (this rank's slices)",
+             dflash2_weights_bytes(*dfcfg, tp_world, dflash2_fp8_));
+    if (Bf12Companions::enabled()) {
+      // The drafter's 12-bit companions (dflash2_init packs them after the
+      // load): the five block matrices per layer — under fp8 only the k|v
+      // rows keep a bf16 copy (the feature path's GEMM) — the fc taps and
+      // the hidden projection. The bf16 arena stays (one allocation):
+      // "bf12" and "bf12+bf16" agree on the drafter.
+      const int64_t dH = dfcfg->hidden_size;
+      const int64_t QW = dfcfg->local_q_row(tp_world), KV = dfcfg->local_kv_row(tp_world);
+      const int64_t dI = dfcfg->local_intermediate(tp_world);
+      size_t companions =
+          dflash2_fp8_
+              ? static_cast<size_t>(dfcfg->num_hidden_layers) * Bf12Companions::planned_bytes(2 * KV, dH)
+              : static_cast<size_t>(dfcfg->num_hidden_layers) *
+                    (Bf12Companions::planned_bytes(QW + 2 * KV, dH) + Bf12Companions::planned_bytes(dH, QW) +
+                     2 * Bf12Companions::planned_bytes(dI, dH) + Bf12Companions::planned_bytes(dH, dI));
+      companions += dfcfg->target_layer_ids.size() * Bf12Companions::planned_bytes(dH, dH);
+      companions += Bf12Companions::planned_bytes(dfcfg->selector_rank, dH);
+      plan.add("dflash2 bf12 companions (the bf16 arena stays)", companions);
+    }
+    // The drafter's own KV planes: per layer one k and one v ring of
+    // window-covering blocks per request, plus the alias tables.
+    const int bt = DFlash2Planes::kBlockTokens;
+    const int64_t ring_blocks = (dfcfg->sliding_window + dfcfg->query_rows() + bt - 1) / bt + 1;
+    const int64_t ctx_blocks = (max_context + bt - 1) / bt;
+    plan.add("dflash2 kv planes (per-request window rings + alias tables)",
+             static_cast<size_t>(dfcfg->num_hidden_layers) * 2 * R *
+                     static_cast<size_t>(ring_blocks) * static_cast<size_t>(bt) *
+                     static_cast<size_t>(dfcfg->local_kv_row(tp_world)) * 2 +
+                 R * static_cast<size_t>(ctx_blocks) * 4);
+    const size_t QR = static_cast<size_t>(dfcfg->query_rows());
+    const size_t CR = static_cast<size_t>(df_rows_cap());
+    const size_t dI = static_cast<size_t>(dfcfg->local_intermediate(tp_world));
+    const size_t dQW = static_cast<size_t>(dfcfg->local_q_row(tp_world));
+    const size_t dKV = static_cast<size_t>(dfcfg->local_kv_row(tp_world));
+    plan.add("dflash2 feature path",
+             2 * M * H * 4 + M * H * 2 + CR * H * 2 + CR * 2 * dKV * 2 +
+                 dfcfg->head_dim / 2 * 4 +
+                 M * (4 + 8) * 2);  // acc + tap F32, the contraction, norm/kv scratch, rope table, the walk's row maps
+    plan.add("dflash2 block scratch",
+             QR * (5 * H * 2 + (dQW + 2 * dKV) * 2 + 2 * dQW * 2 + 3 * dI * 2 +
+                   2 * dfcfg->conv_taps * dfcfg->conv_groups() * 2 + 2 * 8) +
+                 dflash2_block_attn_partials_bytes(dfcfg->query_rows(), dfcfg->local_heads(tp_world)));
+    plan.add("dflash2 candidate buffers",
+             QR * (V * 4 + static_cast<size_t>(dfcfg->selector_rank) * 4 +
+                   static_cast<size_t>(dfcfg->selector_top_k) * (4 + 4) + 4) +
+                 static_cast<size_t>(max_requests) * static_cast<size_t>(dfcfg->drafts()) * 4 +
+                 static_cast<size_t>(max_requests) *
+                     (static_cast<size_t>(dfcfg->drafts()) * 4 +
+                      static_cast<size_t>(dfcfg->drafts()) * static_cast<size_t>(dfcfg->selector_top_k) * 4) +
+                 dflash2_topk_ws_bytes(static_cast<int64_t>(V), dfcfg->query_rows(),
+                                       dfcfg->selector_top_k) +
+                 (tp_world > 1
+                      ? dflash2_topk_table_elems(dfcfg->query_rows(), dfcfg->selector_top_k, tp_world) * 2
+                      : 0));
   }
   plan.add("gemm workspace (at least)", kGemmWsBase);
   plan.add("kda scratch", KdaLayer::persistent_hot_bytes(kda_cfg, max_tokens));
@@ -662,6 +742,44 @@ GlmDiagnosticModel::~GlmDiagnosticModel() {
   cudaFreeHost(moe_trace_ids_);
   cudaFreeHost(moe_trace_weights_);
   cudaFreeHost(moe_trace_biased_);
+  df_planes_.free();
+  cudaFree(df_inv_freq_);
+  cudaFree(df_acc_);
+  cudaFree(df_t32_);
+  cudaFree(df_collapsed_);
+  cudaFree(df_norm_);
+  cudaFree(df_kv_);
+  cudaFree(df_resid_);
+  cudaFree(df_x_);
+  cudaFree(df_xc_);
+  cudaFree(df_qkv_);
+  cudaFree(df_q_);
+  cudaFree(df_attn_);
+  cudaFree(df_attn_part_);
+  cudaFree(df_o_);
+  cudaFree(df_mlp_);
+  cudaFree(df_gate_);
+  cudaFree(df_up_);
+  cudaFree(df_zero_);
+  cudaFree(df_delta_);
+  cudaFree(df_h_);
+  cudaFree(df_logits_);
+  cudaFree(df_topk_ws_);
+  cudaFree(df_hidden32_);
+  cudaFree(df_ids_);
+  cudaFree(df_sc_);
+  cudaFree(df_tok_);
+  cudaFree(df_pos_);
+  cudaFree(df_tokens_);
+  cudaFree(df_walk_req_);
+  cudaFree(df_walk_pos_);
+  cudaFree(df_table_);
+  cudaFreeHost(df_tok_h_);
+  cudaFreeHost(df_io64_h_);
+  cudaFreeHost(df_walk_req_h_);
+  cudaFreeHost(df_walk_pos_h_);
+  cudaFreeHost(df_mirror_h_);
+  cudaFreeHost(df_cands_h_);
   if (moe_prefill_trace_ids_) cudaFreeHost(moe_prefill_trace_ids_);
   if (moe_prefill_trace_weights_) cudaFreeHost(moe_prefill_trace_weights_);
   if (moe_prefill_trace_biased_) cudaFreeHost(moe_prefill_trace_biased_);

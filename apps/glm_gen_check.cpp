@@ -418,6 +418,9 @@ static std::vector<int64_t> g_group_check_b_tokens;
 // --kv-format: the DSA latent cache's storage format for the fabric run's
 // model (bf16 default; the teacher-forced KV-dtype A/B passes fp8/fp4 here).
 dgpp::LatentFormat g_kv_format = dgpp::LatentFormat::kBf16;
+// --dflash-model: the DFlash2 block drafter's checkpoint dir (resolved in
+// main; the fabric construction passes it to the model).
+std::string g_dflash_dir;
 
 // The memory receipt: exactly what the model pre-allocates for this knob
 // combination, by region, plus the per-request reserve math. Runs with or
@@ -817,7 +820,7 @@ int run_scheduler(const GlmTextConfig& cfg, const std::string& ckpt,
     GlmDiagnosticModel model(cfg, ckpt, max_tokens, z.pool_tokens,
                              /*boundary=*/nullptr, /*tp_rank=*/0,
                              /*tp_world=*/1, dgpp::GlmResidency::Streaming,
-                             dgpp::GlmHeadSharding::Full, max_requests);
+                             dgpp::GlmHeadSharding::Full, max_requests);  // w1: no drafter (the fabric path carries it)
     DGPP_LOG_INFO(
         "w1 model constructed in {:.1f}s (streaming, {} request slots)",
         std::chrono::duration<double>(std::chrono::steady_clock::now() -
@@ -1574,7 +1577,7 @@ int run(const GlmTextConfig& cfg, const std::string& ckpt, int world,
                  : dgpp::GlmResidency::Streaming,
         dgpp::GlmHeadSharding::VocabSharded,
         /*max_requests=*/g_group_check_b_tokens.empty() ? 1 : 2, mtp,
-        g_kv_format);
+        g_kv_format, /*serving_logits=*/false, g_dflash_dir);
     if (g_gr_probe_layers > 0) model.set_gr_probe_layers(g_gr_probe_layers);
     const double construct_s = std::chrono::duration<double>(
                                    std::chrono::steady_clock::now() -
@@ -1927,6 +1930,7 @@ int main(int argc, char** argv) {
   bool resident = true, incremental = true, no_eos = false;
   bool decode_graph = false;
   bool mtp = false;
+  std::string dflash_model, dflash_weights = "checkpoint";
   bool sampling_profile = false;
   bool sample = false;
   std::optional<float> temperature, top_p, min_p, repetition_penalty;
@@ -1968,6 +1972,8 @@ int main(int argc, char** argv) {
     else if (a == "--group-check-b") g_group_check_b = next();
     else if (a == "--decode-graph") decode_graph = true;
     else if (a == "--mtp") mtp = true;
+    else if (a == "--dflash-model") dflash_model = next();
+    else if (a == "--dflash-weights") dflash_weights = next();
     else if (a == "--kv-format") {
       const auto f = dgpp::latent_format_from_string(next());
       if (!f) {
@@ -2120,6 +2126,24 @@ int main(int argc, char** argv) {
       DGPP_LOG_ERROR("no CUDA device visible");
       return 1;
     }
+  }
+  if (!dflash_model.empty() && mtp) {
+    DGPP_LOG_ERROR("--dflash-model replaces --mtp: enable one or the other, not both");
+    return 1;
+  }
+  if (!dflash_model.empty()) {
+    if (std::filesystem::is_directory(dflash_model)) {
+      g_dflash_dir = dflash_model;
+    } else {
+      std::string err;
+      g_dflash_dir = dgpp::hf::model_dir(dflash_model, &err);
+      if (g_dflash_dir.empty()) {
+        DGPP_LOG_ERROR("dflash_model {}: {}", dflash_model, err);
+        return 1;
+      }
+    }
+    dgpp::GlmDiagnosticModel::set_dflash2_weights_fp8(dflash_weights == "fp8");
+    DGPP_LOG_INFO("the DFlash2 block drafter: {} (weights {})", g_dflash_dir, dflash_weights);
   }
   try {
     GlmTextConfig cfg =

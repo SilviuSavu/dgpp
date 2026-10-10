@@ -479,7 +479,15 @@ class DFlash2Speculator {
                                       int snapshot_base) {
     const int T = static_cast<int>(fed.size());
     const SpecVerdict v = judge_verify(fed, winners);
-    if (T > 1) model_.session_rollback(req_, v.accepted, T, snapshot_base);
+    if (T > 1) {
+      // The session core's rollback takes the batch's rows and the slot's
+      // snapshot base; a replay family (GLM-5.3-Flash) records its own row
+      // count at the verify and rolls back by the accepted count alone.
+      if constexpr (requires { model_.session_rollback(req_, v.accepted, T, snapshot_base); })
+        model_.session_rollback(req_, v.accepted, T, snapshot_base);
+      else
+        model_.session_rollback(req_, v.accepted);
+    }
     ++steps_;
     accepted_drafts_ += v.accepted - 1;
     // The scheduler's MTP group, per draft position (sched MtpAcceptance):

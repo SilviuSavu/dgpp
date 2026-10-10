@@ -1003,4 +1003,28 @@ void dflash2_topk_merge(const uint16_t* table, int rows, int k, int world, int32
   DGPP_CUDA_OK(cudaGetLastError());
 }
 
+namespace {
+
+__global__ void embed_rows_kernel(const uint16_t* __restrict__ embed,
+                                  const int64_t* __restrict__ tokens, uint16_t* __restrict__ dst,
+                                  int64_t vocab, int rows, int hidden) {
+  const int r = blockIdx.x;
+  if (r >= rows) return;
+  const int64_t t = tokens[r];
+  const uint16_t* src = embed + t * hidden;
+  uint16_t* out = dst + static_cast<int64_t>(r) * hidden;
+  for (int i = threadIdx.x; i < hidden; i += blockDim.x) out[i] = src[i];
+}
+
+}  // namespace
+
+void dflash2_embed_rows(const uint16_t* embed, const int64_t* tokens, uint16_t* dst,
+                        int64_t vocab, int rows, int hidden, cudaStream_t stream) {
+  if (rows <= 0) return;
+  if (embed == nullptr || tokens == nullptr || dst == nullptr || hidden <= 0)
+    throw std::invalid_argument("dflash2_embed_rows: arguments");
+  embed_rows_kernel<<<rows, 128, 0, stream>>>(embed, tokens, dst, vocab, rows, hidden);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
 }  // namespace dgpp

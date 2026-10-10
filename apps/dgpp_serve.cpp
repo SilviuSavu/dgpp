@@ -348,6 +348,7 @@ struct GlmFamily final : ServeFamily {
   std::string ckpt;
   int world = 1;
   dgpp::LatentFormat kv_format = dgpp::LatentFormat::kBf16;
+  std::string dflash;  // the DFlash2 drafter's checkpoint dir (empty: off)
   std::unique_ptr<dgpp::GlmDiagnosticModel> model;
   GlmFamily(const std::string& checkpoint, int world_, dgpp::LatentFormat fmt)
       : cfg(dgpp::GlmTextConfig::from_json_file((fs::path(checkpoint) / "config.json").string())),
@@ -380,7 +381,7 @@ struct GlmFamily final : ServeFamily {
         cfg, forward_rows, context, fabric ? rank : 0, fabric ? world_ : 1,
         fabric ? dgpp::GlmResidency::Resident : dgpp::GlmResidency::Streaming,
         fabric ? dgpp::GlmHeadSharding::VocabSharded : dgpp::GlmHeadSharding::Full, slots,
-        fabric && mtp, kv_format, /*serving_logits=*/true);
+        fabric && mtp, kv_format, /*serving_logits=*/true, dflash);
   }
   size_t snapshot_bytes(int world_, bool mtp) const override {
     return dgpp::GlmDiagnosticModel::session_snapshot_bytes(cfg, world_, mtp);
@@ -394,7 +395,7 @@ struct GlmFamily final : ServeFamily {
         cfg, ckpt, forward_rows, pool_tokens, reducer, fabric ? rank : 0, fabric ? world_ : 1,
         fabric ? dgpp::GlmResidency::Resident : dgpp::GlmResidency::Streaming,
         fabric ? dgpp::GlmHeadSharding::VocabSharded : dgpp::GlmHeadSharding::Full, slots,
-        fabric && mtp, kv_format, /*serving_logits=*/true);
+        fabric && mtp, kv_format, /*serving_logits=*/true, dflash);
     // Neither the eager nor graph serving path consumes diagnostic routes.
     model->set_decode_route_traces(false);
   }
@@ -418,6 +419,7 @@ struct GlmFamily final : ServeFamily {
     return std::make_unique<dgpp::EagerEngineAdapter<dgpp::GlmDiagnosticModel>>(
         model.get(), slots, std::move(pick), std::move(sample), grammar, prefix_slots);
   }
+  void set_draft_model(const std::string& dir) override { dflash = dir; }
 };
 
 // Qwen3.8-Flash-Next: the paged K/V + compressed-key pool (64-token

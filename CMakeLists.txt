@@ -602,10 +602,12 @@ add_library(dgpp_models_glm_loader STATIC
   src/models/glm/forward.cpp
   src/models/glm/decode.cpp
   src/models/glm/mtp.cpp
+  src/models/glm/dflash2.cpp
+  src/models/glm/dflash2_model.cpp
   src/models/glm/tp.cpp
   src/models/glm/tp_parity.cpp)
 target_link_libraries(dgpp_models_glm_loader
-  PUBLIC dgpp_models_glm dgpp_models_moe dgpp_kernels dgpp_models_kda dgpp_models_dsa dgpp_device_ranges)
+  PUBLIC dgpp_models_glm dgpp_models_moe dgpp_kernels dgpp_models_kda dgpp_models_dsa dgpp_device_ranges dgpp_models_qwen_loader)
 dgpp_set_common(dgpp_models_glm_loader)
 
 add_executable(glm_bind_check apps/glm_bind_check.cpp)
@@ -631,12 +633,12 @@ dgpp_set_common(dsv4_bind_check)
 # driver the CI glm_tp_test pins at the fixture, against the real
 # checkpoint via --model (HF hub cache). No bus dependency.
 add_executable(glm_shard_parity apps/glm_shard_parity.cpp)
-target_link_libraries(glm_shard_parity PRIVATE dgpp_models_glm_loader)
+target_link_libraries(glm_shard_parity PRIVATE dgpp_models_glm_loader dgpp_models_qwen_loader)
 dgpp_set_common(glm_shard_parity)
 
 # Deployment evidence: stream real layers, reconcile bytes vs formula.
 add_executable(glm_stream_check apps/glm_stream_check.cpp)
-target_link_libraries(glm_stream_check PRIVATE dgpp_models_glm_loader)
+target_link_libraries(glm_stream_check PRIVATE dgpp_models_glm_loader dgpp_models_qwen_loader)
 dgpp_set_common(glm_stream_check)
 
   # The small-collective stall repro (engine hunt instrument, not a CI gate
@@ -731,7 +733,7 @@ if(DGPP_ENABLE_IBV)
   # M6 Stage 1d: greedy generation end-to-end at real dims (w1 local
   # reference + fabric TP with the distributed pick).
   add_executable(glm_gen_check apps/glm_gen_check.cpp)
-  target_link_libraries(glm_gen_check PRIVATE dgpp_models_glm_loader dgpp_bus
+  target_link_libraries(glm_gen_check PRIVATE dgpp_models_glm_loader dgpp_models_qwen_loader dgpp_bus
                                             CUDA::cudart Threads::Threads)
   dgpp_set_common(glm_gen_check)
 
@@ -830,6 +832,7 @@ add_executable(unit_tests
   tests/unit/glm_dsa_config_test.cpp
   tests/unit/glm_dsa_binding_test.cpp
   tests/unit/glm_dsa_dflash2_test.cpp
+  tests/unit/glm_dflash2_test.cpp
   tests/unit/dsv41_config_test.cpp
   tests/unit/dsv41_binding_test.cpp
   tests/unit/dsv4_config_test.cpp
@@ -844,7 +847,7 @@ target_link_libraries(unit_tests PRIVATE CUDA::cudart dgpp_loaders
                                         dgpp_models_glm dgpp_models_qwen dgpp_models_qwen_loader
                                         dgpp_models_glm4
                                         dgpp_models_glm_dsa dgpp_models_dsv41 dgpp_models_dsv4 dgpp_models_mimo
-                                        dgpp_models_glm_dsa_layers
+                                        dgpp_models_glm_dsa_layers dgpp_models_glm_loader
                                         dgpp_rope_scaling
                                         dgpp_net dgpp_serve Threads::Threads)
 target_compile_definitions(unit_tests PRIVATE DGPP_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")

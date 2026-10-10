@@ -1465,6 +1465,10 @@ GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_run_rows(
         mhc_update_rows(sub_out_, cur, nxt, TA, TB);  // the previous FFN site's block B
         std::swap(cur, nxt);
         ffn_b_pending = false;
+        if (df_pending_tap_ >= 0) {  // the drafter's deferred tap boundary
+          dflash2_capture_tap(df_pending_tap_, cur, T);
+          df_pending_tap_ = -1;
+        }
         mhc_site_rows(cur, hw, b.ln1, TA, TB);
       }
       if (boundary_ && !boundary_->begin_async(attn_out, TA, H)) boundary_->reduce(attn_out, TA, H);
@@ -1731,11 +1735,18 @@ GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_run_rows(
     if (ffn_comb_deferred) DGPP_CUDA_OK(cudaStreamWaitEvent(stream_, mhc_join_, 0));
     if (ffn_b_pending) {
       mhc_update_rows(ffn_out, cur, nxt, 0, TA);  // block B's follows its fold
+      // The DFlash2 drafter's tap on this boundary waits for block B's
+      // update (the next layer's seam completes it): cur holds only block
+      // A's rows yet.
+      df_pending_tap_ = dflash2_ && df_tap_[static_cast<size_t>(layer)] >= 0 ? layer : -1;
     } else {
       launch_mhc_stream_update(post_, comb_, ffn_out, cur, nxt, mhc_cfg_, T,
                                stream_);
       std::swap(cur, nxt);
       capture_walk(cur);
+      // The drafter's tap: the boundary streams are complete here.
+      if (dflash2_ && df_tap_[static_cast<size_t>(layer)] >= 0)
+        dflash2_capture_tap(layer, cur, T);
     }
   }
   if (ffn_b_pending) {
@@ -1745,6 +1756,22 @@ GlmDiagnosticModel::Outputs GlmDiagnosticModel::session_run_rows(
     mhc_update_rows(sub_out_, cur, nxt, TA, TB);
     std::swap(cur, nxt);
     ffn_b_pending = false;
+    if (df_pending_tap_ >= 0) {
+      dflash2_capture_tap(df_pending_tap_, cur, T);
+      df_pending_tap_ = -1;
+    }
+  }
+
+  // The drafter's context planes: every walk's rows also land as the
+  // draft layers' K/V at their positions (the glm_dsa port's contract —
+  // rejected verify rows included, masked by position later). Decode rows
+  // read the session's device metadata (works under capture, kernels
+  // only); prefill walks upload their per-row maps first.
+  if (dflash2_) {
+    if (decode_row)
+      dflash2_store_features(T, d_req_ids_, d_step_pos_);
+    else
+      dflash2_store_walk(req, token_start, T);
   }
 
   // ---- head: mean over streams, final norm, lm head -----------------
