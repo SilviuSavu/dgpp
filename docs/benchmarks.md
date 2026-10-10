@@ -39,6 +39,7 @@ The seven configurations affected by the latest prefill fixes have updated servi
 | GLM-5.3-Flash NVFP4/FP8 | 2 | 160K FP8 KV, 4 slots | 30.6–36.0 | 29.6–34.5 | 43.0–46.8 | 55.3–61.2 | 56.4–61.8 | [2.057 / 8.384 / 35.312](../benchmarks/results/2026-10-07-prefill-followup/raw/glm-flash-hybrid-w2/prefill/idle2048/prefill.json) |
 | GLM-5.3-Flash NVFP4/FP8 | 2 | 256K FP8 KV, 2 slots | 30.7–36.1 | 29.6–34.6 | 43.1–46.9 | 44.7–48.1 | 44.5–47.2 | 1.976 / 8.178 / 35.025 |
 | GLM-5.3-Flash NVFP4/FP8 | 4 | 768K BF16 KV, 4 slots | 56.8–62.2 | 54.8–59.7 | 79.5–85.4 | 106.2–117.7 | 105.7–116.0 | 1.182 / 5.075 / 21.843 |
+| GLM-5.3-Flash NVFP4/FP8 + DFlash2 | 4 | 768K BF16 KV, 4 slots, block drafter (dbr 4) | 66.9 | 55.8–74.6 | 53.5–81.4 | 55.9–75.2 | 55.0–74.7 | 1.408 / 5.818 / 24.215 |
 | GLM-5.3-Flash FP8 | 4 | 384K BF16 KV, 4 slots | 46.7–51.5 | 44.8–49.2 | 60.1–64.4 | 77.5–86.2 | 77.6–84.9 | 1.334 / 5.686 / 24.491 |
 | GLM-5.3-Flash FP8 | 4 | 512K BF16 KV, 4 slots, 2 GiB prefix cache | 46.8–51.6 | 44.9–49.3 | 60.2–64.4 | 77.8–86.3 | 77.5–85.8 | 1.356 / 5.716 / 24.507 |
 | Qwen3.8-Flash-Next NVFP4 | 1 | FP8 dense | 41.7–49.6 | 40.7–48.1 | 62.1–73.1 | 86.5–97.7 | 84.3–98.9 | 1.363 / 4.522 / 18.054 |

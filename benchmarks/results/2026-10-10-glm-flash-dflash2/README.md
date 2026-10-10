@@ -47,3 +47,22 @@ model routed rows 5-8 into cuBLASLt/MMA (`set_decode_rows(4)`,
   instantaneous; its shorter step wins chat 4.8 s vs 6.4 s and code
   4.2 vs 4.5, the block wins json 2.8 vs 3.2 and math 3.4 vs 3.5)
 - ab_block.json / ab_plain2.json / ab_final2.json: the depth-7 gates
+
+## Serving suite (2026-10-10, the shipped dbr 4 lane)
+
+`scripts/serve_load.py` five classes x 3 reps, max_tokens 320, greedy,
+plus `scripts/serve_prefill_probe.py` cold prefill (3 probes per length)
+against the live deployment — raw/serving/{dflash2-dbr4.json,prefill.json}.
+
+- C1 engine decode: median 66.9 tok/s (49.9-76.5 across class windows) —
+  the plain 4-node template's 56.8-62.2 (same kv/slots)
+- C1 wall per class: prose 56.9, chat 55.8 (level with plain's 54.8-59.7);
+  code 73.2, json 74.6, math 73.7 (+22-33%)
+- C2/C4/C8 walls stay 53.5-81.4: the whole 8-row batch is one request's
+  block, so concurrent requests serialize across steps instead of sharing
+  decode rows — plain reaches 79.5-117.7 by interleaving its 4 slots in
+  one batch. The multi-request block (several requests' rows in one
+  recorded block draft) is the lane's concurrency follow-up.
+- Cold prefill 1.408 / 5.818 / 24.215 s at ~2K/~8K/~32K (plain:
+  1.182 / 5.075 / 21.843): the drafter's tap capture and plane stores
+  ride every prefill chunk (~16-19%).
