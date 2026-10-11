@@ -57,6 +57,14 @@ inline void check_decode_graph(cudaGraph_t graph, int rank,
     size_t deps = 0;
     DGPP_CUDA_OK(cudaGraphNodeGetDependencies(node, nullptr, nullptr, &deps));
     max_in = std::max(max_in, deps);
+    if (t == cudaGraphNodeTypeMemset) {
+      // The offending buffer's identity: a memset node carries its device
+      // pointer and width (the 2026-10-11 D9b capture triage).
+      cudaMemsetParams p;
+      DGPP_CUDA_OK(cudaGraphMemsetNodeGetParams(node, &p));
+      DGPP_LOG_INFO("rank {}: {} memset node: dst {} width {} pitch {} value {}",
+                    rank, what, p.dst, p.width, p.pitch, p.value);
+    }
   }
   DGPP_LOG_INFO(
       "rank {}: {} shape: {} nodes, {} edges: kernel {} empty {} memcpy {} "

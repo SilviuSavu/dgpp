@@ -91,9 +91,9 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
   // max_tokens bounds a walk's rows (a prefill chunk, the diagnostic
   // forward); max_cache_tokens the pool's capacity in tokens (rounded up
   // to a block) — shared by every slot (max_context()). max_requests: the
-  // session slots (at most 16: the decode batch's cap, plan D9 — the fused
+  // session slots (at most 16: kPickMaxRequests' verdict bound, plan D9 — the fused
   // select runs its rows in groups of eight). mtp: the draft block.
-  // decode_rows: the fixed decode batch's row ceiling (at most 16, the
+  // decode_rows: the fixed decode batch's row ceiling (at most 32, the
   // same bound; 0 = kDecodeRows). latent_format:
   // the latent cache's storage (bf16, fp8 or fp4; the rope key and the
   // index cache are unaffected).
@@ -136,10 +136,13 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
 
   static constexpr int prefill_chunk_tokens() { return kPrefillChunkTokens; }
   static constexpr int kv_block_tokens_static() { return kBlockTokens; }
-  // The decode batch's cap (plan D9): sixteen rows since 2026-09-13 (eight
-  // slots at MTP depth 1, five at depth 2); the fused select launches
-  // them in groups of eight, the pick kernels verdict sixteen requests.
-  static constexpr int decode_rows_cap() { return 16; }
+  // The decode batch's cap (plan D9): eight rows until 2026-09-13, sixteen
+  // until 2026-10-11, thirty-two since (plan D9b: the DFlash2 lane's
+  // 8-row blocks — four slots a pass; live slots past the four-slot family
+  // replay scalar graphs);
+  // the fused select launches them in groups of eight, the pick kernels
+  // verdict sixteen request slots (kDecodeRowsMax bounds the row arrays).
+  static constexpr int decode_rows_cap() { return 32; }
   // The same number for a shape that is not built yet (the memory plan).
   static size_t session_snapshot_bytes(const GlmDsaTextConfig& cfg, int tp_world, bool mtp);
   using Base::session_snapshot_bytes;

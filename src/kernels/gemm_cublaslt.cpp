@@ -25,6 +25,15 @@ namespace dgpp {
 namespace {
 constexpr size_t kRecommendedWorkspace = 64ull << 20;
 
+
+// Kernels-only decode graphs: a split-K algorithm's workspace memsets must
+// not enter a capture (get_plan's capturing pick prefers workspace-free
+// algorithms).
+bool stream_capturing(cudaStream_t s) {
+  cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+  return cudaStreamIsCapturing(s, &st) == cudaSuccess &&
+         st == cudaStreamCaptureStatusActive;
+}
 // Full plan identity: shapes, dtypes, and activation leading dimension. The
 // old packed uint64 key had no room for the row stride, and a hash-fold risks
 // silently aliasing two plans — determinism beats cleverness here.
@@ -186,7 +195,7 @@ struct CublasLtGemm::Impl {
       launch_bf12_expand(e.m, r0, nb, slot.mem, stream);
       ++expansions;
       Plan& pb = get_plan(m, nb, k, DType::BF16, od, act_row_stride, workspace, ws_bytes, 1, 0, 0, 0,
-                          nullptr, false, false, /*out_ld=*/n);
+                          nullptr, false, false, /*out_ld=*/n, stream_capturing(stream));
       void* ob = static_cast<uint8_t*>(out) + static_cast<size_t>(r0) * out_elem;
       cublasStatus_t st = cublasLtMatmul(lt, pb.desc, &alpha, slot.mem, pb.la, act, pb.lb, &beta, ob,
                                          pb.ld, ob, pb.ld, &algo, workspace, ws_bytes, stream);
@@ -231,7 +240,7 @@ struct CublasLtGemm::Impl {
                  size_t ws_bytes, int batch = 1, int64_t act_batch_stride = 0,
                  int64_t weight_batch_stride = 0, int64_t out_batch_stride = 0,
                  const uint16_t* bias = nullptr, bool weight_kn = false,
-                 bool fp32_reductions = false, int out_ld = 0) {
+                 bool fp32_reductions = false, int out_ld = 0, bool capturing = false) {
     PlanKey key{m,
                 n,
                 k,
@@ -331,22 +340,38 @@ struct CublasLtGemm::Impl {
           "FP32 reductions");
     }
 
-    cublasLtMatmulHeuristicResult_t heur{};
+    cublasLtMatmulHeuristicResult_t heur[8]{};
     int nres = 0;
     cublasStatus_t st =
-        cublasLtMatmulAlgoGetHeuristic(lt, p.desc, p.la, p.lb, p.ld, p.ld, pref, 1, &heur, &nres);
+        cublasLtMatmulAlgoGetHeuristic(lt, p.desc, p.la, p.lb, p.ld, p.ld, pref, 8, heur, &nres);
     cublasLtMatmulPreferenceDestroy(pref);
     if (st != CUBLAS_STATUS_SUCCESS || nres == 0)
       throw std::runtime_error(std::format(
           "cublasLt no heuristic for m={} n={} k={} dtype={}", m, n, k,
           dtype_name(io)));
-    p.algo = heur.algo;
-    p.ws_bytes = heur.workspaceSize;
+    int pick = 0;
+    if (capturing) {
+      // A decode graph must stay kernels-only (graph_check): a split-K
+      // algorithm zeroes its reduction workspace with memset nodes inside
+      // the capture — the 2026-10-11 D9b boot died on 24 of them from the
+      // 3-slot family's first 24-row GEMM shapes. Workspace-free
+      // algorithms cannot split K over a workspace; prefer the first, in
+      // the heuristic's own order. Prefill plans (never captured) keep
+      // the heuristic's first choice.
+      for (int i = 0; i < nres; ++i)
+        if (heur[i].workspaceSize == 0) {
+          pick = i;
+          break;
+        }
+    }
+    p.algo = heur[pick].algo;
+    p.ws_bytes = heur[pick].workspaceSize;
 
     auto [ins, ok] = plans.emplace(key, p);
     return ins->second;
   }
 };
+
 
 int dense_gemv_rows() {
   static const int rows = [] {
@@ -576,7 +601,8 @@ void CublasLtGemm::matmul(const void* act, const void* weight, void* out,
     return;
   }
   Impl::Plan& p = impl_->get_plan(m, n, k, io_dtype, out_dtype,
-                                  act_row_stride, workspace, ws_bytes);
+                                  act_row_stride, workspace, ws_bytes,
+                                  1, 0, 0, 0, nullptr, false, false, 0, stream_capturing(stream));
   // A row block of a wider chunk takes the chunk's algorithm (set_plan_rows).
   // bf16 calls only: the fp8 dot GEMMs already run in context-sized tiles
   // and keep their own algorithm either way.
@@ -586,10 +612,10 @@ void CublasLtGemm::matmul(const void* act, const void* weight, void* out,
   const bool pinned = impl_->pinned_rows > 0 && m > impl_->decode_rows && m != impl_->pinned_rows &&
                       io_dtype == DType::BF16 && impl_->plan_rows == 0;
   const Impl::Plan& chosen =
-      pinned ? impl_->get_plan(impl_->pinned_rows, n, k, io_dtype, out_dtype, act_row_stride, workspace, ws_bytes)
+      pinned ? impl_->get_plan(impl_->pinned_rows, n, k, io_dtype, out_dtype, act_row_stride, workspace, ws_bytes, 1, 0, 0, 0, nullptr, false, false, 0, stream_capturing(stream))
       : impl_->plan_rows > m && io_dtype == DType::BF16
           ? impl_->get_plan(impl_->plan_rows, n, k, io_dtype, out_dtype, act_row_stride,
-                            workspace, ws_bytes)
+                            workspace, ws_bytes, 1, 0, 0, 0, nullptr, false, false, 0, stream_capturing(stream))
           : p;
   if (released) {
     impl_->lt_released(act, weight, *packed, out, m, out_dtype, act_row_stride, workspace, ws_bytes,
@@ -643,12 +669,14 @@ void CublasLtGemm::matmul_batched_bf16(const uint16_t* act, const uint16_t* weig
       out_stride < static_cast<int64_t>(m) * n)
     throw std::invalid_argument("batched BF16 matmul: invalid shape or overlapping batch stride");
   auto& p = impl_->get_plan(m, n, k, DType::BF16, GemmOut::F32, k, workspace, ws_bytes, batch,
-                            act_stride, weight_stride, out_stride, nullptr, weight_kn);
+                            act_stride, weight_stride, out_stride, nullptr, weight_kn, false, 0,
+                            stream_capturing(stream));
   const auto& chosen =
       plan_rows > m
           ? impl_->get_plan(plan_rows, n, k, DType::BF16, GemmOut::F32, k, workspace, ws_bytes,
                             batch, static_cast<int64_t>(plan_rows) * k, weight_stride,
-                            static_cast<int64_t>(plan_rows) * n, nullptr, weight_kn)
+                            static_cast<int64_t>(plan_rows) * n, nullptr, weight_kn, false, 0,
+                            stream_capturing(stream))
           : p;
   const float alpha = 1.f, beta = 0.f;
   DGPP_CUBLAS_OK(cublasLtMatmul(impl_->lt, p.desc, &alpha, weight, p.la, act, p.lb, &beta, out,
@@ -661,7 +689,7 @@ void CublasLtGemm::matmul_linear_bf16(const uint16_t* act, const uint16_t* weigh
                                       void* workspace, size_t ws_bytes, cudaStream_t stream) {
   if (m <= 0 || n <= 0 || k <= 0) throw std::invalid_argument("BF16 linear: invalid shape");
   auto& p = impl_->get_plan(m, n, k, DType::BF16, GemmOut::BF16, k, workspace, ws_bytes, 1, 0, 0, 0,
-                            bias, false, true);
+                            bias, false, true, 0, stream_capturing(stream));
   if (bias)
     DGPP_CUBLAS_OK(cublasLtMatmulDescSetAttribute(p.desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &bias,
                                                   sizeof(bias)),
@@ -679,7 +707,8 @@ void CublasLtGemm::matmul_fp8_scaled(const uint8_t* act, const uint8_t* weight,
   if (m <= 0 || n <= 0 || k <= 0) throw std::invalid_argument("FP8 scaled matmul: invalid shape");
   if (!act || !weight || !act_scale || !weight_scale || !out)
     throw std::invalid_argument("FP8 scaled matmul: null pointer");
-  auto& p = impl_->get_plan(m, n, k, DType::F8_E4M3, GemmOut::BF16, k, workspace, ws_bytes);
+  auto& p = impl_->get_plan(m, n, k, DType::F8_E4M3, GemmOut::BF16, k, workspace, ws_bytes,
+                           1, 0, 0, 0, nullptr, false, false, 0, stream_capturing(stream));
   // Per-call scales overwrite the plan-cached unit pointers (the
   // matmul_linear_bf16 bias-pointer precedent): the heuristic's validity
   // does not depend on the pointed-to values.

@@ -2566,7 +2566,7 @@ int main(int argc, char** argv) {
     // MTP depth) — floored at kDecodeRows so every existing recipe keeps
     // its exact shape (4 slots x 2 rows = 8). The family's cap bounds it:
     // Qwen supports up to 64 rows, GLM-4.7 up to 32, and the full
-    // GLM-5.3 up to 16. Fitting batch families remain available when
+    // GLM-5.3 up to 32 (D9b, 2026-10-11; sixteen until then). Fitting batch families remain available when
     // a deeper configuration exceeds the full-batch ceiling.
     // Reject configurations whose depth-1 batch already exceeds the cap.
     // The DFlash2 eager path verifies a full block per slot per step: the

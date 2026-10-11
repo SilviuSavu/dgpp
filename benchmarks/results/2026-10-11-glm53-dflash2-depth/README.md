@@ -88,3 +88,55 @@ The dbr-6 fallback row is obsolete — row 32 beats it on chat too.
   requests still serialize on one eight-row block a step).
 - Re-run this A/B after the expert-read work (DGPP_MOE_DECODE_GROUPED, the
   upstream GLM-5.3 GPTQ quants) — the knee moves with the pass floor.
+
+## D9b: the 32-row decode batch — the multi-request block (the same evening)
+
+`GlmDsaModel::decode_rows_cap()` 16 -> 32 (the DSA layer's matching [1,16]
+validation; the select already grouped rows by eight and its workspace
+already bounded 32). Two real fixes on the way:
+
+- The first 3-slot capture died on 24 memset graph nodes: cuBLASLt's
+  heuristic handed the new 24-row GEMM shapes a split-K algorithm whose
+  workspace zeroing is a memset inside the capture (decode graphs must stay
+  kernels-only). The plan builder now prefers workspace-free algorithms
+  whenever it runs on a capturing stream; `graph_check` logs any memset
+  node's pointer/width for triage. The boot then captured the whole family
+  tree: 2/3/4-slot x 8-row blocks with every scheduled-depth variant,
+  kernels-only, 1.36 GiB device headroom left on rank 0.
+- Unit gates: dsa_test, glm_moe_test, the glm_dsa forward chain and
+  glm_dsa_dflash2_test all green on the 32-row build.
+
+### C1-C8 aggregate walls (tok/s; the 16-row baseline above vs the 32-row lane)
+
+| class | C1 | C2 | C4 | C8 |
+|---|---|---|---|---|
+| prose 16-row | 31.6 | 31.9 | 27.7 | 25.4 |
+| prose 32-row | 32.2 | 31.7 | **38.8** | 26.9 |
+| code 16-row | 33.8 | 36.9 | 32.6 | 30.8 |
+| code 32-row | 36.4 | 36.7 | **43.5** | 29.9 |
+| json 16-row | 33.7 | 36.5 | 39.3 | 34.3 |
+| json 32-row | 32.5 | 35.4 | **49.1** | 33.0 |
+| math 16-row | 34.8 | 41.6 | 36.0 | 37.2 |
+| math 32-row | 33.7 | 41.8 | **45.5** | 37.0 |
+| chat 16-row | 22.8 | 31.8 | 28.5 | 28.8 |
+| chat 32-row | 22.4 | 32.1 | **41.0** | 27.9 |
+
+- The exit gate holds everywhere: C4 beats the C2 aggregate in every class
+  (a second/third/fourth block in the pass pays), +25-44 % over the 16-row
+  C4 walls.
+- C2 is flat (the same 2-slot family serves it before and after — the
+  sanity anchor) and C1 is level within day-noise (mean 31.4 vs 32.2; the
+  scalar path is untouched).
+- C8 is flat as expected: eight live slots still take two 4-slot passes;
+  the 64-row batch (eight blocks a pass) is the next rung, already inside
+  kDecodeRowsMax.
+- Acceptance inside the 4-slot passes is deep and healthy: 5.0-5.8
+  tok/step/req with real mass through p7 (56-89 %) — the schedule takes
+  deeper steps when four blocks amortize the pass.
+- Transcripts: batched-vs-scalar prefix divergence matches the documented
+  near-tie class (a C2 output diverged from its C1 twin at char 18-41 on
+  the 16-row lane too — cross-dispatch, tolerance-equal, pre-existing);
+  outputs stay coherent, no degenerate loops, all requests finish clean.
+
+Raw suites: `rows32-c1c2c4c8.json` (and the 16-row baselines
+`final-32-c1c2c4c8.json` + `final-32-c2c4c8-baseline-b.json`).

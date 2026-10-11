@@ -519,6 +519,18 @@ the schedule. The seams, audited 2026-10-11:
   `dflash2_batch_slots()` blocks a forward and the recorded batch draft takes
   the family's slots; the planes and feature path scale per slot.
 
+Implementation (2026-10-11, the same day): `decode_rows_cap()` 32, the DSA
+layer's `[1, 16]` validation to `[1, 32]` (the select workspace already
+bounded rows at 32; the groups-of-eight select and the scaled scratch needed
+nothing), and one real discovery — the first 3-slot capture died on 24 memset
+graph nodes: cuBLASLt's heuristic hands the new 24-row GEMM shapes a split-K
+algorithm whose workspace zeroing is a memset inside the capture, and decode
+graphs must stay kernels-only. The plan builder now prefers workspace-free
+algorithms whenever it runs on a capturing stream (graph_check logs any
+memset node's pointer and width for the next triage). The boot then captured
+the whole family tree: 2/3/4-slot x 8-row blocks with every scheduled-depth
+variant, kernels-only.
+
 Gates: the unit suites (glm_moe_test, glm_dsa_dflash2_test, the DSA forward
 fixture) at 32-row shapes; the fabric lane's transcripts under the 4-slot
 family pass the near-tie rule against the scalar path; the C1 walls are
