@@ -75,12 +75,12 @@ DsaLayer::ScratchLayout DsaLayer::scratch_layout(
   if (max_tokens <= 0 || max_cache_tokens <= 0)
     throw std::invalid_argument(
         "dsa layer: max_tokens and max_cache_tokens must be positive");
-  // 32 since 2026-10-11, plan D9b (16 since 2026-09-13; 8 before): the
-  // fused select runs the rows in groups of eight, the attention tiles
-  // and the (row, split) workspace below scale with the count, and the
-  // select's workspace already bounded rows at 32.
-  if (max_decode_rows <= 0 || max_decode_rows > 32)
-    throw std::invalid_argument("dsa layer: max_decode_rows must be in [1, 32]");
+  // 64 since 2026-10-11 evening, plan D9b's last rung (32 that morning, 16
+  // since 2026-09-13, 8 before): the fused select runs the rows in groups
+  // of eight, the attention tiles and the (row, split) workspace below
+  // scale with the count, and the select's workspace layout covers 64.
+  if (max_decode_rows <= 0 || max_decode_rows > 64)
+    throw std::invalid_argument("dsa layer: max_decode_rows must be in [1, 64]");
   if (max_decode_rows > max_tokens)
     throw std::invalid_argument(
         "dsa layer: max_decode_rows must not exceed max_tokens");

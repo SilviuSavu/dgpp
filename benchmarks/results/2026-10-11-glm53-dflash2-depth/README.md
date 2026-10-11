@@ -140,3 +140,26 @@ already bounded 32). Two real fixes on the way:
 
 Raw suites: `rows32-c1c2c4c8.json` (and the 16-row baselines
 `final-32-c1c2c4c8.json` + `final-32-c2c4c8-baseline-b.json`).
+
+## D9b's last rung: the 64-row batch (the same evening)
+
+`kSelectLayoutRows` 32 -> 64 (the select workspace layout; the groups-of-
+eight launcher and everything else already scaled), the layer/model caps
+matched, `prefix_cache_gib` 1.0 -> 0.5 for headroom. The boot captured the
+whole tree — 2/3/4/6/8-slot x 8-row blocks, kernels-only, 0.70 GiB free on
+rank 0 — and eight blocks ride one verify pass:
+
+| class | C1 | C2 | C4 | C8 |
+|---|---|---|---|---|
+| prose | 32.1 | 31.0 | 39.5 | **47.8** |
+| code | 36.4 | 37.1 | 43.4 | **49.1** |
+| json | 32.6 | 34.5 | 49.8 | **52.1** |
+| math | 34.5 | 41.3 | 45.0 | **53.6** |
+| chat | 22.0 | 31.9 | 41.1 | **48.1** |
+
+C8 now beats C4 in every class (+45-88 % over the 16-row baseline's C8;
+the staircase is closed: C1 ~32 -> C8 ~50 aggregate); C1/C2/C4 level with
+the 32-row run; per-request acceptance at C8 is 2.2-2.7 tok/step (the
+eight-block pass amortizes the step). Unit gates green on the 64-row build
+(dsa, glm_moe, the forward chain, glm_dsa_dflash2, dflash2 kernels).
+Raw: `rows64-c1c2c4c8.json`.

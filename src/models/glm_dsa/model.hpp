@@ -137,12 +137,11 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
   static constexpr int prefill_chunk_tokens() { return kPrefillChunkTokens; }
   static constexpr int kv_block_tokens_static() { return kBlockTokens; }
   // The decode batch's cap (plan D9): eight rows until 2026-09-13, sixteen
-  // until 2026-10-11, thirty-two since (plan D9b: the DFlash2 lane's
-  // 8-row blocks — four slots a pass; live slots past the four-slot family
-  // replay scalar graphs);
+  // until 2026-10-11, thirty-two for a day, sixty-four since (plan D9b's
+  // rungs: the DFlash2 lane's 8-row blocks — eight slots a pass);
   // the fused select launches them in groups of eight, the pick kernels
   // verdict sixteen request slots (kDecodeRowsMax bounds the row arrays).
-  static constexpr int decode_rows_cap() { return 32; }
+  static constexpr int decode_rows_cap() { return 64; }
   // The same number for a shape that is not built yet (the memory plan).
   static size_t session_snapshot_bytes(const GlmDsaTextConfig& cfg, int tp_world, bool mtp);
   using Base::session_snapshot_bytes;

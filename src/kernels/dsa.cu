@@ -3396,7 +3396,7 @@ void dsa_gather_index_pools(const int32_t* block_table, int pools_per_block,
 
 namespace {
 constexpr int kSelectMaxRows = 8;      // rows per launch: the kernel's shared-memory bound
-constexpr int kSelectLayoutRows = 32;  // rows the workspace is laid out for (the decode batch's cap; 32 since 2026-09-14 for DeepSeek-V4.1's six-slot batch)
+constexpr int kSelectLayoutRows = 64;  // rows the workspace is laid out for (the decode batch's cap; 32 since 2026-09-14 for DeepSeek-V4.1's six-slot batch, 64 since 2026-10-11 for the GLM-5.3 DFlash2 lane's eight-block passes, plan D9b)
 constexpr int kSelectDefaultGrid = 96;  // measured optimum (dsa_select_bench, 2026-09-06)
 size_t select_align256(size_t b) { return (b + 255) / 256 * 256; }
 size_t select_keys_bytes(int rows, int64_t pools) {
@@ -3409,7 +3409,7 @@ size_t select_hist_bytes(int rows) {
 
 size_t dsa_select_workspace_bytes(int max_rows, int64_t max_pools) {
   if (max_rows <= 0 || max_rows > kSelectLayoutRows || max_pools <= 0)
-    throw std::invalid_argument("dsa_select_workspace_bytes: rows in [1, 32], pools > 0");
+    throw std::invalid_argument("dsa_select_workspace_bytes: rows in [1, 64], pools > 0");
   // Laid out for kSelectLayoutRows rows regardless of max_rows:
   // the histograms follow the keys at a FIXED offset the launcher derives
   // the same way, whatever row count a call brings. (They used to follow
