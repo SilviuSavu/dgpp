@@ -68,3 +68,48 @@ lane config ready) remains the untested candidate — its int8 expert
 activations promise a decode-side win (kernel-level -16% expert-block
 median) at one more fidelity caveat (unmeasured task accuracy,
 2x one-ulp input sensitivity).
+
+## Addendum (same day): Mixed346 GPTQ H32-A8 g128 — the C4-C8 win
+
+Same procedure, deploy/cluster_glm-5.3_mixed346_w4.json (identical recipe,
+model swapped), cold boot 2795s (image 98.1 GiB, boots warm after), suite
+in m346-suite.json.
+
+| class | int8 C1/C8 | nf4i8 C1/C8 | m346 C1/C8 |
+|---|---|---|---|
+| prose | 32.1 / 47.8 | 28.0 / 47.9 | 30.7 / 50.4 |
+| code  | 36.4 / 49.1 | 36.8 / 48.5 | 36.2 / 49.5 |
+| json  | 32.6 / 52.1 | 32.6 / 51.0 | 33.0 / 55.0 |
+| math  | 34.5 / 53.6 | 34.5 / 53.5 | 33.3 / 57.1 |
+| chat  | 22.0 / 48.1 | 23.3 / 48.1 | 24.4 / 51.4 |
+
+Class-mean deltas vs int8: C1 +0.0%, C2 +5.0%, C4 +3.2%, C8 +5.1%.
+The throughput-bound tiers win everywhere; C1 is parity (prose C1 dips
+to 30.7 — half of NF4I8's dip; every other C1 class is at or above int8).
+
+Draft acceptance is the surprise: p1 75%, p2 75%, p3 69%, p4/p5 100%
+(int8: 72/60/50/100/100) — the A8 target agrees with the unchanged
+DFlash2 drafter MORE often, and the deeper acceptance compounds the
+kernel-side speedup into the C4-C8 wins. Transcripts spot-checked
+(prose, math): coherent reasoning, correct problem setup, no drift.
+Boot ledger: device free 98.4 GiB after globals — the least headroom of
+the three lanes (NF4I8 102.7, int8 ~100.2), consistent with the A8
+activation buffers.
+
+Remaining caveat, unchanged from the research phase: the publisher
+shipped no generated-task evals for this quant (NF4I8's gsm8k/HumanEval/
+schema parity does not transfer automatically), and A8 doubles one-ulp
+input sensitivity at the kernel level. The higher measured acceptance
+and coherent transcripts are the evidence we have; a task-level eval
+suite on the lane would close it.
+
+## Three-way verdict
+
+- Stay int8 for: single-stream latency-identical serving, max headroom
+  certainty, known task behavior.
+- NF4I8: quality-parity-or-better, throughput parity, +2.6 GiB/rank —
+  switch only if KV/prefix pools grow into the space.
+- Mixed346: +5% at C4-C8 with higher acceptance, C1 parity — the
+  serving-side winner IF a task-level eval confirms no generated-quality
+  regression. Recommended next gate: 50-100 prompt task eval
+  (gsm8k-style + code + schema) on the m346 lane vs int8 transcripts.
