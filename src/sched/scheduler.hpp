@@ -599,6 +599,7 @@ class Scheduler {
     int64_t prefix_duplicates = 0;
     int64_t prefix_skipped = 0;
     int64_t prefix_skipped_no_block = 0;
+    int64_t prefix_skipped_hop_mismatch = 0;
     int64_t prefix_skipped_image_bytes = 0;
     int64_t prefix_image_bytes = 0;
     int64_t prefix_blocks_pinned = 0;

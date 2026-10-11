@@ -1075,8 +1075,22 @@ void Scheduler::step_batch(const std::vector<int>& arrivals) {
       ++cache_.stats().skipped_no_block;
       continue;
     }
-    if (position != hop)
-      throw std::logic_error("Scheduler: the hop snapshot's position differs from the armed position");
+    if (position != hop) {
+      // The armed hop landed elsewhere: a multi-row step or a pool-pressure
+      // release moved the rolling slot between the arm and this retire. An
+      // entry the close path does not expect would poison reuse, so drop the
+      // snapshot (engine release + arena slot back), forget the rolling
+      // state, and count it — the same treatment as the failed-replacement
+      // path above (issue #73's pattern). A snapshot is an optimisation;
+      // one that landed off its mark must not fail the engine (issue #103).
+      free_arena_slot(r.rolling_slot);
+      r.rolling_slot = -1;
+      r.rolling_position = -1;
+      ++cache_.stats().skipped_hop_mismatch;
+      DGPP_LOG_WARN("prefix cache: hop snapshot landed at {} while armed at {}; dropped",
+                    position, hop);
+      continue;
+    }
     r.rolling_position = hop;
     ++cache_.stats().rolling;
     ++cache_.stats().hops;
@@ -1662,6 +1676,7 @@ Scheduler::Meters Scheduler::meters() const {
   m.prefix_duplicates = cache_.stats().duplicates;
   m.prefix_skipped = cache_.stats().skipped_no_slot;
   m.prefix_skipped_no_block = cache_.stats().skipped_no_block;
+  m.prefix_skipped_hop_mismatch = cache_.stats().skipped_hop_mismatch;
   m.prefix_skipped_image_bytes = cache_.stats().skipped_image_bytes;
   m.prefix_image_bytes = static_cast<int64_t>(cache_.image_bytes());
   m.prefix_blocks_pinned = cache_.blocks_pinned(prefix_info_.block_tokens);

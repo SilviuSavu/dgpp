@@ -65,6 +65,7 @@ class PrefixCache {
     int64_t duplicates = 0;     // an entry already existed at the position
     int64_t skipped_no_slot = 0;  // a snapshot wanted, no slot free or evictable
     int64_t skipped_no_block = 0;  // a snapshot wanted, no pool block for its partial copy
+    int64_t skipped_hop_mismatch = 0;  // a hop snapshot landed off its armed position (dropped)
     int64_t skipped_image_bytes = 0;
   };
 
