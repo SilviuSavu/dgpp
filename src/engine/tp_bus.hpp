@@ -139,11 +139,35 @@ struct BusBoundaryReducer final : BoundaryReducer {
     // the same canonical per-element chain (bitwise-equal to chunking —
     // the bus_test cross-path gate pins exactly that).
     if (total > 2 * max_elems_) {
-      std::string err;
-      const uint64_t id = bus_.allreduce_bulk(partial, partial, total, &err);
-      if (id == 0)
-        throw std::runtime_error("boundary reduce: bulk rejected: " + err);
-      wait_collective(id, "boundary bulk");
+      // One bulk collective per slice, never one for the whole boundary: a
+      // single-shot fold the size of a full unwindowed prefill (7331 rows x
+      // 6144 hidden, 90 MB) trips transport retry limits on one lane
+      // (2026-10-11, teacher A/B; wc status=12 toward one peer), while the
+      // engine's per-window bulk folds — the same machine at ~8 MB — run all
+      // day. Disjoint slices are exact: the cross-path gate pins bulk ==
+      // chunked bitwise.
+      constexpr size_t kBulkSliceElems = 4u << 20;  // 4M elems = 8 MB bf16
+      // DGPP_BULK_SLICE_GAP_US: optional microsecond pause between slices.
+      // Default 0 (engine cadence needs none — compute separates its folds).
+      // Diagnostic forwards fire slices back-to-back at line rate, which
+      // starves one peer's bulk consumer past its deadline (2026-10-11,
+      // teacher A/B); a small gap restores the engine's proven duty cycle.
+      static const int slice_gap_us = [] {
+        const char* g = getenv("DGPP_BULK_SLICE_GAP_US");
+        return g ? std::atoi(g) : 0;
+      }();
+      for (size_t off = 0; off < total; off += kBulkSliceElems) {
+        const size_t n = std::min(kBulkSliceElems, total - off);
+        if (slice_gap_us > 0 && off > 0)
+          std::this_thread::sleep_for(
+              std::chrono::microseconds(slice_gap_us));
+        std::string err;
+        const uint64_t id =
+            bus_.allreduce_bulk(partial + off, partial + off, n, &err);
+        if (id == 0)
+          throw std::runtime_error("boundary reduce: bulk rejected: " + err);
+        wait_collective(id, "boundary bulk");
+      }
       return;
     }
     // Floor: rows folded per collective (hidden itself when hidden fills

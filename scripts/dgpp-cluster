@@ -425,7 +425,11 @@ class Cluster:
             for rank, host in self.peers:
                 if not self.remote_control("status", rank, host):
                     say(f"WARN: peer rank {rank} not observed on {host}")
-        if not self.wait_log(r0, f"listening on :{self.http}", 600, "rank 0 serving", proc):
+        # Cold resident-image builds (a new checkpoint's first boot) read the
+        # whole shard set over the farm mounts and can outlast the warm-boot
+        # budget; DGPP_BOOT_WAIT_S overrides (default 600s, the warm figure).
+        boot_wait_s = int(os.environ.get("DGPP_BOOT_WAIT_S", "600"))
+        if not self.wait_log(r0, f"listening on :{self.http}", boot_wait_s, "rank 0 serving", proc):
             raise RuntimeError("rank 0 did not become ready")
         bind = self.cfg["http"]["bind_host"]
         client_host = self.nodes[0] if bind == "0.0.0.0" else bind

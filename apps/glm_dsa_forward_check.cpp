@@ -52,6 +52,13 @@
 static dgpp::LatentFormat g_kv_format = dgpp::LatentFormat::kBf16;
 
 int main(int argc, char** argv) {
+  // The engine pins before construction for exactly this failure class
+  // (2026-09-02): an unpinned unified-memory page reclaimed under load
+  // faults inside a live RDMA registration — local protection error
+  // (vendor 129), 3.5 s completion stalls, lane retries exhausted
+  // (2026-10-11, the teacher A/B's bulk folds wedged mid-forward). The
+  // diagnostic rides the same fabric and the same watermark; it needs
+  // the same pin. DGPP_MLOCK=off skips it, as in serving.
   std::string model_id, ckpt, ids_text, dump_states, peer, image_dir, text, teacher_file;
   int decode_steps = 0;
   int topk = 5, layers = -1, world = 1, rank = 0, port = 29950;
@@ -142,6 +149,7 @@ int main(int argc, char** argv) {
     const dgpp::GlmDsaResidency residency = resident ? dgpp::GlmDsaResidency::Resident : dgpp::GlmDsaResidency::Streaming;
     DGPP_LOG_INFO("glm_dsa_forward_check: {} — {} tokens, {} layers, {} world {} rank {}", ckpt, T,
                   cfg.num_hidden_layers, resident ? "resident" : "streaming", world, rank);
+    dgpp::pin_serving_process(rank);
     std::unique_ptr<dgpp::net::CollectiveBus> bus;
     std::unique_ptr<dgpp::BusBoundaryReducer> reducer;
     if (world > 1) {
