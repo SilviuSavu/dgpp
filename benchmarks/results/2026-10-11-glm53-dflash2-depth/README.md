@@ -163,3 +163,19 @@ the 32-row run; per-request acceptance at C8 is 2.2-2.7 tok/step (the
 eight-block pass amortizes the step). Unit gates green on the 64-row build
 (dsa, glm_moe, the forward chain, glm_dsa_dflash2, dflash2 kernels).
 Raw: `rows64-c1c2c4c8.json`.
+
+## The upstream merge (the same evening)
+
+Merged origin/master (38d3af69: the GLM-5.3 GPTQ quants, llama.cpp timings,
+HTTP binding setup) into the line — two real conflicts: CHANGELOG (both
+sides' entries kept) and moe_layer's grouped-expert chain (upstream's
+Mixed346/A8 branches under our grouped-decode `views` parameter threading;
+upstream's structure, our rename — behavior-identical for prefill, which
+passes `d_views_prefill_` as `views`). Post-merge: full rebuild clean, the
+unit gates green except portability_test's
+`test_localhost_and_deployment_http_override`, which fails BYTE-IDENTICALLY
+on pristine origin/master (their test expects a localhost config to resolve
+127.0.0.1 while their own DEFAULTS pin DGPP_HTTP_BIND=0.0.0.0) — pre-existing
+upstream breakage, left as-is and documented here. The merged lane boots the
+64-row world unchanged (5 families, kernels-only, 0.75 GiB free) and the
+C1/C4 smoke is level (prose 31.9/37.0, code 35.7/43.7).
