@@ -486,6 +486,48 @@ lowering: a sixteen-row deployment prefills prompts of 9–16 tokens through
 the GEMV chain where an eight-row one used cuBLASLt — last-bit
 differences, deterministic within a deployment.
 
+**D9b — the 32-row decode batch: the multi-request block (planned 2026-10-11).**
+The DFlash2 lane's verify is 8 rows a slot, so the sixteen-row batch holds ONE
+other request's block: a 2-slot family replays, C4 takes two passes and C8 four
+(the recorded C2–C8 flatness). Doubling the decode batch to 32 rows puts FOUR
+8-row blocks in one pass and an eight-slot capped family at 4 rows each under
+the schedule. The seams, audited 2026-10-11:
+
+- `GlmDsaModel::decode_rows_cap()` 16 → 32, and every `kDecodeRows`-shaped
+  default that keys off it (the diagnostic wrapper's shape helpers, the serve
+  app's `max(kDecodeRows, max_concurrency × rows_per_request)`).
+- The fused select already launches rows in groups of `kSelectMaxRows` = 8
+  (dsa.cu) — four groups is the same work per group; no kernel change.
+- The pick kernels verdict `kPickMaxRequests` = 16 request slots — eight
+  serving slots stay inside; only >16 concurrent slots would need it wider.
+- The DSA attention tiles and (row, split) workspace scale with the count
+  (the memory plan must re-fit; rank 0 sits at ~2.9 GiB free with the 1 GiB
+  prefix cache — trim `prefix_cache_gib` before shrinking the pool).
+- The MoE slot kernel takes the rows (the grouped chain stays off: the
+  2026-10-09 A/B lost at 8 rows, 160 vs 148 ms; re-measure at 32 only if the
+  slot kernel's expert re-streams dominate).
+- Dispatch seam: `dense_gemv_rows()` defaults to 4 (no env override on this
+  lane), so decode GEMMs already mix GEMV and cuBLASLt per row count — the
+  batch-vs-scalar gate is the near-tie rule, not bitwise (D9's precedent at
+  9–16-token prefills). No row-invariance campaign needed.
+- The bus's graph-variant budget (`kBusMaxGraphVariants` = 128; variants per
+  depth = 2 × (slots + families)) binds first: 32 rows add the 3- and 4-slot
+  families beside 2 and every-slot, and the schedule's depth options multiply.
+  Budget the options explicitly (drop the scalar-slot options the recipe never
+  replays, or trim depth options for the wide families) before the first boot.
+- The drafter side already parameterizes: `dflash2_draft_batch` stacks
+  `dflash2_batch_slots()` blocks a forward and the recorded batch draft takes
+  the family's slots; the planes and feature path scale per slot.
+
+Gates: the unit suites (glm_moe_test, glm_dsa_dflash2_test, the DSA forward
+fixture) at 32-row shapes; the fabric lane's transcripts under the 4-slot
+family pass the near-tie rule against the scalar path; the C1 walls are
+unchanged (the 2-slot family's replays keep their shape); the C2/C4/C8 suite
+(the 2026-10-11 baseline in
+benchmarks/results/2026-10-11-glm53-dflash2-depth/) shows the aggregate lift —
+the exit gate is C4 ≥ the C2 aggregate (a second block pays for its rows) and
+no C1 regression.
+
 **D10 — Tokenizer, template, tools.** The Flash tokenizer goldens are
 registered against this checkpoint unchanged (identical bytes; the suite is
 hash-keyed and skips if the cached file differs); a fourth chat-template
