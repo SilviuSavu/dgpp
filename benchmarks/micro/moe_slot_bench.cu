@@ -7,16 +7,28 @@
 // pays 42 of them (2026-09-06: gate_up 255 us + down 168 us per layer on
 // rank 0's trace, the down at 224 GB/s against gate_up's 295).
 //
-// Usage: moe_slot_bench [--rows N] [--iters N] [--warmup N] [--inter N] [--format fp8|fp4|packq]
-//                       [--bits 4|8] [--sf 0|1] [--experts E] [--hidden H] [--topk K] [--no-shared]
+// Usage: moe_slot_bench [--rows N] [--prefill] [--iters N] [--warmup N] [--inter N] [--format fp8|fp4|packq]
+//                       [--bits 4|8] [--sf 0|1|2] [--rotate] [--experts E] [--hidden H] [--topk K] [--no-shared]
 //   --format fp4: the routed experts as NVFP4 triples (e2m1 pairs, e4m3
 //   scales per 16, one global per matrix — docs/nvfp4_plan.md), the shared
 //   expert FP8 as in the composed checkpoint; bytes accounted per format.
 //   --format packq: the routed experts packed-int at --bits with the scale
 //   format --sf (0: bf16 per 64, full GLM-5.3; 1: f16 per 128, the Qwen3.8
-//   AutoRound hybrid), the shared expert int8 per 64 (or none: --no-shared,
+//   AutoRound hybrid; 2: the NF4I8 codebook, bf16 per 128, with --rotate
+//   the H32 input rotation the checkpoint carries), the shared expert int8
+//   per 64 (or none: --no-shared,
 //   which also selects the softmax-top-k router — the Qwen chain:
 //   --format packq --sf 1 --experts 512 --hidden 2560 --inter 640 --topk 10 --no-shared).
+//   --m346 FORM (2026-10-09): the Mixed346 contract — every routed expert in
+//   FORM ("444", "334", "446", "333", "666", "443", "336" or "existing"),
+//   or "census" (the checkpoint's mix: 82 % 444, 11 % 334, 2.3 % 446, 1.8 %
+//   333, 1.5 % 443, 0.6 % existing, 0.4 % 336 / 666), the shared expert
+//   int8; the chain quantizes the rows to int8 codes per step
+//   (kMoeInputHadamard32Int8). Bytes accounted per expert form.
+//   --prefill (2026-10-10): time enqueue_prefill over --rows tokens (the
+//   prefill chunk's chain: tensor-core tiles from 128 rows) instead of the
+//   decode slot chain; the byte line then understates (experts are shared
+//   across a chunk's rows).
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -24,6 +36,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "common/cuda_check.hpp"
@@ -50,8 +63,10 @@ struct DevBuf {
 
 int main(int argc, char** argv) {
   int rows = 2, iters = 100, warmup = 10, inter = 512;
+  bool prefill = false;  // --prefill: time enqueue_prefill (the chunk chain) over `rows` tokens instead
   int experts = 0, hidden_opt = 0, topk = 0, packq_bits = 4, packq_sf = 0;
-  bool fp4 = false, packq = false, no_shared = false;
+  bool fp4 = false, packq = false, no_shared = false, rotate = false;
+  const char* m346 = nullptr;
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--rows") && i + 1 < argc) rows = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--iters") && i + 1 < argc) iters = std::atoi(argv[++i]);
@@ -63,6 +78,9 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--bits") && i + 1 < argc) packq_bits = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--sf") && i + 1 < argc) packq_sf = std::atoi(argv[++i]);
     else if (!std::strcmp(argv[i], "--no-shared")) no_shared = true;
+    else if (!std::strcmp(argv[i], "--prefill")) prefill = true;
+    else if (!std::strcmp(argv[i], "--rotate")) rotate = true;
+    else if (!std::strcmp(argv[i], "--m346") && i + 1 < argc) { m346 = argv[++i]; packq = true; }
     else if (!std::strcmp(argv[i], "--format") && i + 1 < argc) {
       const char* f = argv[++i];
       fp4 = !std::strcmp(f, "fp4");
@@ -83,6 +101,21 @@ int main(int argc, char** argv) {
   }
   const int E = cfg.n_experts, H = cfg.hidden, I = cfg.inter;
   const bool with_shared = !no_shared;
+  // The Mixed346 forms per routed expert: "gud" digits or "existing".
+  std::vector<std::string> forms;
+  double m346_routed_bytes = 0.0;  // the mean routed expert's triple
+  if (m346) {
+    cfg.routed_int8_activations = true;
+    forms.resize(static_cast<size_t>(E));
+    static const char* kCensus[] = {"444", "334", "446", "333", "443", "existing", "336", "666"};
+    static const int kWeights[] = {15672, 2171, 441, 352, 289, 116, 85, 74};  // of 19200
+    for (int e = 0; e < E; ++e) {
+      if (std::strcmp(m346, "census") != 0) { forms[size_t(e)] = m346; continue; }
+      int pick = int(hash32(0xC3 + uint64_t(e) * 40503) % 19200u), f = 0;
+      while (f < 7 && pick >= kWeights[f]) { pick -= kWeights[f]; ++f; }
+      forms[size_t(e)] = kCensus[f];
+    }
+  }
   // (E+1)*3 matrices: gate/up [I,H] + down [H,I] per expert, then shared.
   const int mats = (E + 1) * 3;
   std::vector<dgpp::GlmQuantMatrix> qm(static_cast<size_t>(mats));
@@ -104,18 +137,27 @@ int main(int argc, char** argv) {
     const int64_t r = down ? H : I, c = down ? I : H;
     if (m >= E * 3 && !with_shared) continue;
     if (packq) {
-      // Routed at --bits / --sf; the shared triple int8, bf16 per 64.
+      // Routed at --bits / --sf (or the expert's Mixed346 form); the shared
+      // triple int8, bf16 per 64.
       const bool routed = m < E * 3;
-      const int bits = routed ? packq_bits : 8;
-      const int sf = routed ? packq_sf : 0;
+      int bits = routed ? packq_bits : 8;
+      int sf = routed ? packq_sf : 0;
+      if (m346 && routed) {
+        const std::string& f = forms[size_t(m / 3)];
+        if (f == "existing") { bits = 4; sf = 0; }
+        else { bits = f[size_t(m % 3)] - '0'; sf = dgpp::kPackedScaleBf16G128Mixed346; }
+      }
       const int g = dgpp::packed_scale_group(sf);
       const size_t wn = size_t(r) * c * bits / 32, sn = size_t(r) * c / g;
+      if (m346 && routed) m346_routed_bytes += double(wn * 4 + sn * 2) / E;
       std::vector<uint32_t> words(wn);
       std::vector<uint16_t> scales(sn);
       for (size_t i = 0; i < wn; ++i) words[i] = hash32(uint64_t(m) * 2654435761ull + i);
       for (size_t i = 0; i < sn; ++i) {
-        const float v = (bits == 4 ? 0.004f : 0.0003f) * (0.5f + float(hash32(99 + uint64_t(m) * 7919 + i) & 0xFFFF) / 65536.f);
-        scales[i] = sf == 0 ? bf16_of(v) : dgpp::float_to_fp16_bits(v);
+        const float base = sf == dgpp::kPackedScaleBf16G128Mixed346 ? (bits == 6 ? 0.001f : 0.00025f)
+                           : bits == 4 ? (sf == dgpp::kPackedScaleBf16G128Nf4i8 ? 0.00025f : 0.004f) : 0.0003f;
+        const float v = base * (0.5f + float(hash32(99 + uint64_t(m) * 7919 + i) & 0xFFFF) / 65536.f);
+        scales[i] = sf == dgpp::kPackedScaleF16G128 ? dgpp::float_to_fp16_bits(v) : bf16_of(v);
       }
       DevBuf* dp = new DevBuf(wn * 4);
       DevBuf* ds = new DevBuf(sn * 2);
@@ -174,6 +216,8 @@ int main(int argc, char** argv) {
   w.experts = (fp4 || packq) ? nullptr : qm.data();
   w.experts_fp4 = fp4 ? fm.data() : nullptr;
   w.experts_packed = packq ? pm.data() : nullptr;
+  if (rotate) w.routed_input_transform = dgpp::kMoeInputHadamard32;
+  if (m346) w.routed_input_transform = dgpp::kMoeInputHadamard32Int8;
   if (with_shared) {
     for (int m = 0; m < 3; ++m) {
       if (packq) w.shared_packed[m] = pm[size_t(E) * 3 + m];
@@ -181,7 +225,7 @@ int main(int argc, char** argv) {
     }
   }
 
-  dgpp::GlmMoeLayer layer(w, cfg, rows, /*decode_slots=*/rows);
+  dgpp::GlmMoeLayer layer(w, cfg, rows, /*decode_slots=*/prefill ? 2 : rows);
   std::vector<uint16_t> hidden(size_t(rows) * H);
   for (size_t i = 0; i < hidden.size(); ++i) hidden[i] = bf16_of((float(hash32(9 + i) & 0xFFFF) / 65536.f - 0.5f) * 2.f);
   DevBuf dh(hidden.size() * 2), dout(hidden.size() * 2);
@@ -192,7 +236,8 @@ int main(int argc, char** argv) {
   // f32 form the Qwen MoE layer runs; the GLM chain the bf16 one.
   DevBuf dacc(size_t(rows) * H * 4);
   auto launch = [&] {
-    if (with_shared) layer.enqueue_decode(dh.as<uint16_t>(), dout.as<uint16_t>(), rows, nullptr, s);
+    if (prefill) layer.enqueue_prefill(dh.as<uint16_t>(), dout.as<uint16_t>(), rows, nullptr, s);
+    else if (with_shared) layer.enqueue_decode(dh.as<uint16_t>(), dout.as<uint16_t>(), rows, nullptr, s);
     else layer.enqueue_decode_f32(dh.as<uint16_t>(), dacc.as<float>(), rows, nullptr, s);
   };
   for (int i = 0; i < warmup; ++i) launch();
@@ -217,21 +262,27 @@ int main(int argc, char** argv) {
   const double per_expert_fp4 = 3.0 * double(H) * I / 2 + 3.0 * double(H) * I / 16 + 12;
   const double per_expert_packq = 3.0 * double(H) * I * packq_bits / 8 + 3.0 * double(H) * I / packq_group * 2;
   const double per_shared_packq = 3.0 * double(H) * I + 3.0 * double(H) * I / 64 * 2;
-  const double per_routed = packq ? per_expert_packq : (fp4 ? per_expert_fp4 : per_expert_fp8);
+  const double per_routed = m346 ? m346_routed_bytes : packq ? per_expert_packq : (fp4 ? per_expert_fp4 : per_expert_fp8);
   const double per_shared = with_shared ? (packq ? per_shared_packq : per_expert_fp8) : 0.0;
   const double bytes = double(rows) * (cfg.top_k * per_routed + per_shared);
   char label[96];
-  if (packq)
-    std::snprintf(label, sizeof label, "packq int%d %s routed%s", packq_bits,
-                  packq_sf ? "g128/f16" : "g64/bf16", with_shared ? " + int8 shared" : ", no shared");
+  if (m346)
+    std::snprintf(label, sizeof label, "mixed346 %s routed (int8 codes)%s", m346,
+                  with_shared ? " + int8 shared" : ", no shared");
+  else if (packq)
+    std::snprintf(label, sizeof label, "packq %s%s routed%s",
+                  packq_sf == dgpp::kPackedScaleBf16G128Nf4i8 ? "nf4i8 g128/bf16" : packq_bits == 4 ? "int4 " : "int8 ",
+                  packq_sf == dgpp::kPackedScaleBf16G128Nf4i8 ? (rotate ? " + H32" : "")
+                  : packq_sf ? "g128/f16" : "g64/bf16",
+                  with_shared ? " + int8 shared" : ", no shared");
   else
     std::snprintf(label, sizeof label, "%s%s", fp4 ? "nvfp4 routed" : "fp8",
                   with_shared ? (fp4 ? " + fp8 shared" : "") : ", no shared");
   std::printf("moe_slot_bench [%s]: rows=%d E=%d H=%d I(per rank)=%d top_k=%d weights %.1f GiB resident\n",
               label, rows, E, H, I, cfg.top_k, total_bytes / (1024.0 * 1024 * 1024));
-  std::printf("enqueue_decode: mean %.1f us, min %.1f us; %.1f GB/s at %.0f MB per call (no expert sharing); x42 layers = %.2f ms\n",
-              total / iters * 1e3f, best * 1e3f, bytes / (best * 1e-3) / 1e9, bytes / 1e6,
-              total / iters * 42);
+  std::printf("%s: mean %.1f us, min %.1f us; %.1f GB/s at %.0f MB per call (no expert sharing); x42 layers = %.2f ms\n",
+              prefill ? "enqueue_prefill" : "enqueue_decode", total / iters * 1e3f, best * 1e3f,
+              bytes / (best * 1e-3) / 1e9, bytes / 1e6, total / iters * 42);
   for (DevBuf* b : keep) delete b;
   return 0;
 }

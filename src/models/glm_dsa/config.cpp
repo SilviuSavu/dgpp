@@ -193,15 +193,9 @@ struct QuantRules {
 const char* kAttentionModules[] = {"q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj"};
 const char* kMlpModules[] = {"gate_proj", "up_proj", "down_proj"};
 
-QuantRules parse_quantization(const minijson::Value& root, GlmDsaTextConfig& c) {
-  const minijson::Value* qc = root.find("quantization_config");
-  if (!qc || qc->is_null())
-    reject("quantization_config",
-           "missing — the engine implements the compressed-tensors pack-quantized "
-           "int4/int8 checkpoint; a BF16 GlmMoeDsa checkpoint has no expert path here");
-  if (!qc->is_object()) reject("quantization_config", "not an object");
-  if (const std::string m = optional_string(*qc, "quant_method", ""); m != "compressed-tensors")
-    reject("quantization_config.quant_method", "only compressed-tensors is implemented, got '" + m + "'");
+// The compressed-tensors branch (quant_method compressed-tensors): the
+// int4/int8 pack-quantized checkpoint.
+QuantRules parse_quantization_compressed_tensors(const minijson::Value* qc, GlmDsaTextConfig& c) {
   if (const std::string f = optional_string(*qc, "format", ""); f != "pack-quantized")
     reject("quantization_config.format", "only pack-quantized is implemented, got '" + f + "'");
   if (const std::string s = optional_string(*qc, "quantization_status", "compressed"); s != "compressed")
@@ -265,6 +259,356 @@ QuantRules parse_quantization(const minijson::Value& root, GlmDsaTextConfig& c) 
     }
   }
   return rules;
+}
+
+// --- the NF4I8 contract (quant_method dgpp_nf4i8, 2026-10-08) ---------------
+// HawkBearPig/GLM-5.3-NF4I8-GPTQ-H32-g128 (its FORMAT.md and config.json):
+// `retained_int8` names the int8 g64 attention / shared-expert triples
+// kept from the baseline on an inclusive layer range; `routed_experts`
+// the 4-bit codebook indices (bf16 scales per 128) of the routed experts
+// on the same range, with the input rotation they were quantized under.
+// The branch derives the same per-module rules the compressed-tensors
+// branch does (so the shape check below is shared) and records the routed
+// format; every machine-meaningful field must equal what the kernels
+// implement — the prose fields (`packing`, `modules`, `other_weights`,
+// `arithmetic`) are not read.
+std::pair<int, int> layer_range(const minijson::Value& v, const std::string& field, int layers) {
+  const minijson::Value* l = v.find("layers");
+  if (!l || !l->is_array() || l->items().size() != 2) reject(field, "must be [first, last] (inclusive)");
+  const auto& it = l->items();
+  if (!it[0].is_number() || !it[1].is_number()) reject(field, "non-numeric bound");
+  const int lo = static_cast<int>(it[0].as_int()), hi = static_cast<int>(it[1].as_int());
+  if (lo < 0 || hi < lo || hi >= layers) reject(field, "outside [0, num_hidden_layers)");
+  return {lo, hi};
+}
+
+std::string layer_alternation(int lo, int hi) {
+  std::string s = "(?:";
+  for (int l = lo; l <= hi; ++l) {
+    if (l != lo) s += "|";
+    s += std::to_string(l);
+  }
+  return s + ")";
+}
+
+QuantRules parse_quantization_nf4i8(const minijson::Value* qc, GlmDsaTextConfig& c) {
+  const std::string f = "quantization_config";
+  if (const std::string s = optional_string(*qc, "format", ""); s != "mixed-codebook-packed")
+    reject(f + ".format", "dgpp_nf4i8 is the mixed-codebook-packed format, got '" + s + "'");
+  if (const int v = optional_int(*qc, "format_version", 0); v != 1)
+    reject(f + ".format_version", "the loader implements version 1, got " + std::to_string(v));
+  require_absent(*qc, "kv_cache_scheme", "a KV cache scheme is not implemented (the engine picks its own latent format)");
+  // The retained int8 triples: the baseline's attention and shared expert.
+  const minijson::Value* r8 = qc->find("retained_int8");
+  if (!r8 || !r8->is_object()) reject(f + ".retained_int8", "missing");
+  if (const int g = require_int(*r8, "group_size"); g != 64)
+    reject(f + ".retained_int8.group_size", "the int8 attention / shared triples are group 64, got " + std::to_string(g));
+  if (const std::string s = optional_string(*r8, "scale_dtype", "bfloat16"); s != "bfloat16")
+    reject(f + ".retained_int8.scale_dtype", "must be bfloat16, got '" + s + "'");
+  const auto [lo8, hi8] = layer_range(*r8, f + ".retained_int8.layers", c.num_hidden_layers);
+  // The routed experts: the codebook, the group and the rotation.
+  const minijson::Value* re = qc->find("routed_experts");
+  if (!re || !re->is_object()) reject(f + ".routed_experts", "missing");
+  const std::string rf = f + ".routed_experts";
+  if (const int b = require_int(*re, "bits"); b != 4)
+    reject(rf + ".bits", "the codebook core implements 4-bit indices, got " + std::to_string(b));
+  if (const int g = require_int(*re, "group_size"); g != 128)
+    reject(rf + ".group_size", "the codebook core implements group 128, got " + std::to_string(g));
+  if (const std::string s = optional_string(*re, "indices_dtype", "int32"); s != "int32")
+    reject(rf + ".indices_dtype", "must be int32, got '" + s + "'");
+  if (const std::string s = optional_string(*re, "indices_key", "weight_indices"); s != "weight_indices")
+    reject(rf + ".indices_key", "must be weight_indices, got '" + s + "'");
+  if (const std::string s = optional_string(*re, "scale_dtype", "bfloat16"); s != "bfloat16")
+    reject(rf + ".scale_dtype", "must be bfloat16, got '" + s + "'");
+  {
+    const minijson::Value* cb = re->find("codebook");
+    if (!cb || !cb->is_array() || cb->items().size() != 16) reject(rf + ".codebook", "must list 16 levels");
+    int i = 0;
+    for (const auto& item : cb->items()) {
+      if (!item.is_number() || item.as_int() != kNf4i8Codebook[i])
+        reject(rf + ".codebook", "level " + std::to_string(i) + " differs from the compiled NF4I8 codebook");
+      ++i;
+    }
+  }
+  const auto [loE, hiE] = layer_range(*re, rf + ".layers", c.num_hidden_layers);
+  if (loE != lo8 || hiE != hi8)
+    reject(rf + ".layers", "must equal retained_int8.layers (the loader implements one packed range)");
+  {
+    const minijson::Value* t = re->find("input_transform");
+    if (!t || !t->is_object()) reject(rf + ".input_transform", "missing (the H32 rotation the experts were quantized under)");
+    const std::string tf = rf + ".input_transform";
+    if (const std::string s = optional_string(*t, "type", ""); s != "normalized_hadamard")
+      reject(tf + ".type", "the engine implements normalized_hadamard, got '" + s + "'");
+    if (const int b = require_int(*t, "block_size"); b != 32)
+      reject(tf + ".block_size", "the engine implements 32-wide blocks, got " + std::to_string(b));
+    if (const std::string s = optional_string(*t, "axis", "input_channels"); s != "input_channels")
+      reject(tf + ".axis", "must be input_channels, got '" + s + "'");
+    const minijson::Value* a = t->find("apply_to");
+    if (!a || !a->is_array()) reject(tf + ".apply_to", "missing");
+    bool seen[3] = {false, false, false};
+    for (const auto& item : a->items()) {
+      if (!item.is_string()) reject(tf + ".apply_to", "non-string entry");
+      const std::string_view s = item.as_string();
+      int which = -1;
+      for (int m = 0; m < 3; ++m)
+        if (s == kMlpModules[m]) which = m;
+      if (which < 0) reject(tf + ".apply_to", "unknown projection '" + std::string(s) + "'");
+      seen[which] = true;
+    }
+    if (!(seen[0] && seen[1] && seen[2]))
+      reject(tf + ".apply_to", "the rotation applies to gate_proj, up_proj and down_proj");
+  }
+  if (c.hidden_size % 128 != 0)
+    reject("hidden_size", "must be a multiple of 128 (the codebook experts' scale group)");
+  if (c.moe_intermediate_size % 128 != 0)
+    reject("moe_intermediate_size", "must be a multiple of 128 (the codebook experts' scale group)");
+  QuantRules rules;
+  const std::string layers = layer_alternation(lo8, hi8);
+  QuantGroup g8;
+  g8.bits = 8;
+  g8.targets.push_back(make_rule(f + ".retained_int8",
+      "re:model\\.layers\\." + layers +
+      "\\.(?:self_attn\\.(?:q_a_proj|q_b_proj|kv_a_proj_with_mqa|kv_b_proj|o_proj)|"
+      "mlp\\.shared_experts\\.(?:gate_proj|up_proj|down_proj))$"));
+  QuantGroup g4;
+  g4.bits = 4;
+  g4.targets.push_back(make_rule(rf, "re:model\\.layers\\." + layers +
+                                         "\\.mlp\\.experts\\.\\d+\\.(?:gate_proj|up_proj|down_proj)$"));
+  rules.groups.push_back(std::move(g8));
+  rules.groups.push_back(std::move(g4));
+  c.packed_group_size = 64;
+  c.expert_scale_fmt = kPackedScaleBf16G128Nf4i8;
+  c.expert_input_hadamard32 = true;
+  return rules;
+}
+
+// --- the Mixed346 contract (quant_method dgpp_mixed346, 2026-10-09) ----------
+//
+// HawkBearPig/GLM-5.3-Mixed346-GPTQ-H32-A8-g128 (its FORMAT.md): config.json's
+// quantization_config names the format, the group, the rotation block, the
+// activation width and two sidecar files. The baseline block
+// (baseline-quantization-config.json: the int4/int8 release's
+// compressed-tensors rules) describes every tensor the checkpoint kept —
+// the attention, shared-expert and dense/draft tensors and the "existing"
+// experts — and is parsed as that contract. The recipe
+// (quantization-recipe.json) lists every routed expert of every packed
+// layer as three digits in {3, 4, 6} (gate, up, down; gate == up) or
+// "existing", with the three codebooks and the activation policy; each is
+// checked against what the kernels compile. The engine also accepts both
+// blocks inline (quantization_config.baseline / .recipe objects) when no
+// checkpoint directory is at hand — the fixtures' form.
+constexpr const char* kMixed346Format = "dgpp_mixed346_h32_a8_g128_v1";
+
+int recipe_key_int(const minijson::Member& m, const std::string& field, int limit) {
+  if (m.key.empty()) reject(field, "empty key");
+  int v = 0;
+  for (char ch : m.key) {
+    if (ch < '0' || ch > '9') reject(field, "key '" + m.key + "' is not an index");
+    v = v * 10 + (ch - '0');
+    if (v >= limit) reject(field, "key '" + m.key + "' is out of range");
+  }
+  return v;
+}
+
+void check_recipe_string(const minijson::Value& v, const std::string& prefix, const char* key, const char* want) {
+  if (const std::string s = optional_string(v, key, ""); s != want)
+    reject(prefix + "." + key, "must be '" + std::string(want) + "', got '" + s + "'");
+}
+
+void parse_mixed346_recipe(const minijson::Value& r, GlmDsaTextConfig& c, const std::string& f) {
+  if (!r.is_object()) reject(f, "not an object");
+  check_recipe_string(r, f, "format", kMixed346Format);
+  if (const int v = optional_int(r, "version", 0); v != 1) reject(f + ".version", "the loader implements version 1, got " + std::to_string(v));
+  if (const int g = require_int(r, "group_size"); g != 128) reject(f + ".group_size", "the Mixed346 core implements group 128, got " + std::to_string(g));
+  if (const int b = require_int(r, "rotation_size"); b != 32) reject(f + ".rotation_size", "the engine implements 32-wide rotation blocks, got " + std::to_string(b));
+  {
+    const minijson::Value* po = r.find("projection_order");
+    if (!po || !po->is_array() || po->items().size() != 3) reject(f + ".projection_order", "must list gate_proj, up_proj, down_proj");
+    int i = 0;
+    for (const auto& item : po->items()) {
+      if (!item.is_string() || item.as_string() != kMlpModules[i]) reject(f + ".projection_order", "must be gate_proj, up_proj, down_proj in that order");
+      ++i;
+    }
+  }
+  {
+    const minijson::Value* a = r.find("activation");
+    if (!a || !a->is_object()) reject(f + ".activation", "missing");
+    const std::string af = f + ".activation";
+    check_recipe_string(*a, af, "format", "int8");
+    if (const int g = require_int(*a, "group_size"); g != 128) reject(af + ".group_size", "the engine quantizes 128 values per scale, got " + std::to_string(g));
+    check_recipe_string(*a, af, "rounding", "nearest ties-to-even");
+    check_recipe_string(*a, af, "scale", "max(amax/127,1e-30)");
+    check_recipe_string(*a, af, "scale_dtype", "float32");
+    check_recipe_string(*a, af, "rotation", "H32 then BF16 rounding");
+    const minijson::Value* cl = a->find("clamp");
+    if (!cl || !cl->is_array() || cl->items().size() != 2 || !cl->items()[0].is_number() || !cl->items()[1].is_number() ||
+        cl->items()[0].as_int() != -128 || cl->items()[1].as_int() != 127)
+      reject(af + ".clamp", "must be [-128, 127]");
+  }
+  {
+    const minijson::Value* cb = r.find("weight_codebooks");
+    if (!cb || !cb->is_object()) reject(f + ".weight_codebooks", "missing");
+    for (const char* w : {"3", "4", "6"}) {
+      const minijson::Value* t = cb->find(w);
+      const int bits = w[0] - '0';
+      const size_t n = static_cast<size_t>(1) << bits;
+      const std::string cf = f + ".weight_codebooks." + w;
+      if (!t || !t->is_array() || t->items().size() != n) reject(cf, "must list " + std::to_string(n) + " levels");
+      size_t i = 0;
+      for (const auto& item : t->items()) {
+        const int want = packed_code_level(static_cast<unsigned>(i), bits, kPackedScaleBf16G128Mixed346);
+        if (!item.is_number() || item.as_double() != static_cast<double>(want))
+          reject(cf, "level " + std::to_string(i) + " differs from the compiled codebook (" + std::to_string(want) + ")");
+        ++i;
+      }
+    }
+  }
+  if (const minijson::Value* sl = r.find("scale_limits"); sl && !sl->is_null()) {
+    if (!sl->is_object()) reject(f + ".scale_limits", "not an object");
+    for (const char* w : {"3", "4", "6"}) {
+      const int bits = w[0] - '0';
+      const double want = bits == 3 ? 127.0 / 0.75 : (bits == 4 ? 127.0 : 31.0);
+      const minijson::Value* t = sl->find(w);
+      if (!t || !t->is_number() || std::fabs(t->as_double() - want) > 1e-9 * want)
+        reject(f + ".scale_limits." + w, "differs from the format's (" + std::to_string(want) + ")");
+    }
+  }
+  const int L = c.num_hidden_layers, E = c.n_routed_experts;
+  const minijson::Value* lr = r.find("layer_expert_recipes");
+  if (!lr || !lr->is_object() || lr->members().empty()) reject(f + ".layer_expert_recipes", "missing");
+  c.expert_recipe.assign(static_cast<size_t>(L) * static_cast<size_t>(E), 0);
+  std::vector<std::pair<std::string, int>> counts;
+  auto count = [&](const std::string& k) {
+    for (auto& [name, n] : counts)
+      if (name == k) {
+        ++n;
+        return;
+      }
+    counts.emplace_back(k, 1);
+  };
+  for (const auto& lm : lr->members()) {
+    const std::string lf = f + ".layer_expert_recipes." + lm.key;
+    const int l = recipe_key_int(lm, lf, L);
+    if (!c.is_moe_layer(l)) reject(lf, "layer " + std::to_string(l) + " carries no routed experts");
+    if (!lm.value.is_object() || lm.value.members().size() != static_cast<size_t>(E))
+      reject(lf, "must list every one of the " + std::to_string(E) + " routed experts");
+    for (const auto& em : lm.value.members()) {
+      const std::string ef = lf + "." + em.key;
+      const int e = recipe_key_int(em, ef, E);
+      if (!em.value.is_string()) reject(ef, "not a string");
+      const std::string v(em.value.as_string());
+      uint8_t code;
+      if (v == "existing") {
+        code = GlmDsaTextConfig::kExpertRecipeExisting;
+      } else {
+        if (v.size() != 3) reject(ef, "'" + v + "' is not three digits or 'existing'");
+        for (char ch : v)
+          if (ch != '3' && ch != '4' && ch != '6') reject(ef, "'" + v + "': the widths are 3, 4 and 6");
+        if (v[0] != v[1]) reject(ef, "'" + v + "': gate and up must share one width (the kernels stage one input form)");
+        code = static_cast<uint8_t>(((v[0] - '0') << 4) | (v[2] - '0'));
+      }
+      uint8_t& slot = c.expert_recipe[static_cast<size_t>(l) * static_cast<size_t>(E) + static_cast<size_t>(e)];
+      if (slot != 0) reject(ef, "listed twice");
+      slot = code;
+      count(v);
+    }
+  }
+  if (const minijson::Value* rc = r.find("recipe_counts"); rc && !rc->is_null()) {
+    if (!rc->is_object()) reject(f + ".recipe_counts", "not an object");
+    size_t listed = 0;
+    for (const auto& m : rc->members()) {
+      if (!m.value.is_number()) reject(f + ".recipe_counts." + m.key, "not a number");
+      int have = 0;
+      for (const auto& [name, n] : counts)
+        if (name == m.key) have = n;
+      if (have != static_cast<int>(m.value.as_int()))
+        reject(f + ".recipe_counts." + m.key, "says " + std::to_string(m.value.as_int()) + ", the table lists " + std::to_string(have));
+      ++listed;
+    }
+    if (listed != counts.size()) reject(f + ".recipe_counts", "does not name every form the table uses");
+  }
+}
+
+QuantRules parse_quantization_mixed346(const minijson::Value* qc, GlmDsaTextConfig& c, const std::string& dir) {
+  const std::string f = "quantization_config";
+  if (const std::string s = optional_string(*qc, "format", ""); s != kMixed346Format)
+    reject(f + ".format", "dgpp_mixed346 is the " + std::string(kMixed346Format) + " format, got '" + s + "'");
+  if (const int v = optional_int(*qc, "version", 0); v != 1)
+    reject(f + ".version", "the loader implements version 1, got " + std::to_string(v));
+  if (const int g = require_int(*qc, "group_size"); g != 128)
+    reject(f + ".group_size", "the Mixed346 core implements group 128, got " + std::to_string(g));
+  if (const int b = require_int(*qc, "rotation_size"); b != 32)
+    reject(f + ".rotation_size", "the engine implements 32-wide rotation blocks, got " + std::to_string(b));
+  if (const int b = require_int(*qc, "activation_bits"); b != 8)
+    reject(f + ".activation_bits", "the Mixed346 core implements int8 activation codes, got " + std::to_string(b));
+  require_absent(*qc, "kv_cache_scheme", "a KV cache scheme is not implemented (the engine picks its own latent format)");
+  // (minijson references the text it parses: each sidecar's text outlives
+  // its values.)
+  auto sidecar = [&](const char* key, const char* dflt) {
+    const std::string name = optional_string(*qc, key, dflt);
+    if (dir.empty())
+      reject(f + "." + key, "the sidecar '" + name + "' needs the checkpoint directory (parse from the file, or inline the block)");
+    return read_file(dir + "/" + name);
+  };
+  QuantRules rules;
+  if (const minijson::Value* inl = qc->find("baseline"); inl && !inl->is_null()) {
+    if (!inl->is_object()) reject(f + ".baseline", "not an object");
+    if (optional_string(*inl, "quant_method", "") != "compressed-tensors")
+      reject(f + ".baseline.quant_method", "the baseline block is the compressed-tensors contract");
+    rules = parse_quantization_compressed_tensors(inl, c);
+  } else {
+    const std::string text = sidecar("baseline_config_file", "baseline-quantization-config.json");
+    const auto parsed = minijson::parse(text);
+    if (!parsed.root.is_object()) reject(f + ".baseline_config_file", "root is not an object");
+    if (optional_string(parsed.root, "quant_method", "") != "compressed-tensors")
+      reject(f + ".baseline_config_file", "the baseline block is the compressed-tensors contract");
+    rules = parse_quantization_compressed_tensors(&parsed.root, c);
+  }
+  if (const minijson::Value* inl = qc->find("recipe"); inl && !inl->is_null()) {
+    parse_mixed346_recipe(*inl, c, f + ".recipe");
+  } else {
+    const std::string text = sidecar("recipe_file", "quantization-recipe.json");
+    const auto parsed = minijson::parse(text);
+    parse_mixed346_recipe(parsed.root, c, optional_string(*qc, "recipe_file", "quantization-recipe.json"));
+  }
+  if (c.hidden_size % 128 != 0)
+    reject("hidden_size", "must be a multiple of 128 (the Mixed346 experts' scale group)");
+  if (c.moe_intermediate_size % 128 != 0)
+    reject("moe_intermediate_size", "must be a multiple of 128 (the Mixed346 experts' scale group)");
+  c.expert_scale_fmt = kPackedScaleBf16G128Mixed346;
+  c.expert_input_hadamard32 = true;
+  c.expert_activation_bits = 8;
+  return rules;
+}
+
+// The recipe against the packed range the baseline derived: every packed
+// layer's every expert listed, no unpacked layer listed.
+void check_mixed346_coverage(const GlmDsaTextConfig& c) {
+  const int L = c.num_hidden_layers, E = c.n_routed_experts;
+  for (int l = 0; l < L; ++l)
+    for (int e = 0; e < E; ++e) {
+      const uint8_t r = c.expert_recipe[static_cast<size_t>(l) * static_cast<size_t>(E) + static_cast<size_t>(e)];
+      if (c.packed_layer(l) && r == 0)
+        reject("quantization_config.recipe", "layer " + std::to_string(l) + " expert " + std::to_string(e) + " is not in the recipe");
+      if (!c.packed_layer(l) && r != 0)
+        reject("quantization_config.recipe", "layer " + std::to_string(l) + " is listed but not packed under the baseline rules");
+    }
+}
+
+QuantRules parse_quantization(const minijson::Value& root, GlmDsaTextConfig& c, const std::string& dir) {
+  const minijson::Value* qc = root.find("quantization_config");
+  if (!qc || qc->is_null())
+    reject("quantization_config",
+           "missing — the engine implements the compressed-tensors pack-quantized "
+           "int4/int8 checkpoint, the dgpp_nf4i8 codebook checkpoint and the "
+           "dgpp_mixed346 checkpoint; a BF16 GlmMoeDsa checkpoint has no expert path here");
+  if (!qc->is_object()) reject("quantization_config", "not an object");
+  const std::string m = optional_string(*qc, "quant_method", "");
+  if (m == "compressed-tensors") return parse_quantization_compressed_tensors(qc, c);
+  if (m == "dgpp_nf4i8") return parse_quantization_nf4i8(qc, c);
+  if (m == "dgpp_mixed346") return parse_quantization_mixed346(qc, c, dir);
+  reject("quantization_config.quant_method",
+         "only compressed-tensors, dgpp_nf4i8 and dgpp_mixed346 are implemented, got '" + m + "'");
 }
 
 // Applies the file's rules to the module names the table will emit and
@@ -355,7 +699,7 @@ void derive_packed_shape(const QuantRules& rules, GlmDsaTextConfig& c) {
 
 }  // namespace
 
-GlmDsaTextConfig GlmDsaTextConfig::parse(const minijson::Value& root) {
+GlmDsaTextConfig GlmDsaTextConfig::parse(const minijson::Value& root, const std::string& dir) {
   if (!root.is_object()) reject("", "root is not an object");
   GlmDsaTextConfig c;
   const std::string model_type = optional_string(root, "model_type", "glm_moe_dsa");
@@ -511,17 +855,19 @@ GlmDsaTextConfig GlmDsaTextConfig::parse(const minijson::Value& root) {
   if (c.mtp_layer() >= 0 && !c.is_moe_layer(c.mtp_layer()))
     reject("num_nextn_predict_layers", "the draft layer carries the MoE (first_k_dense_replace)");
 
-  const QuantRules rules = parse_quantization(root, c);
+  const QuantRules rules = parse_quantization(root, c, dir);
   derive_packed_shape(rules, c);
   if (c.packed_layer_begin < c.first_k_dense_replace)
     reject("quantization_config", "a packed dense layer is not implemented");
+  if (c.expert_mixed346()) check_mixed346_coverage(c);
   return c;
 }
 
 GlmDsaTextConfig GlmDsaTextConfig::from_json_file(const std::string& path) {
   const std::string json = read_file(path);
   const auto parsed = minijson::parse(json);
-  return parse(parsed.root);
+  const size_t slash = path.find_last_of('/');
+  return parse(parsed.root, slash == std::string::npos ? "." : path.substr(0, slash));
 }
 
 GlmMoeConfig GlmDsaTextConfig::moe_config(int local_inter) const {
@@ -535,6 +881,7 @@ GlmMoeConfig GlmDsaTextConfig::moe_config(int local_inter) const {
   m.norm_topk_prob = norm_topk_prob;
   m.swiglu_limit = std::numeric_limits<float>::infinity();  // GlmMoeDsaMLP: no clamps
   m.router_mode = MoeRouterMode::SigmoidBias;
+  m.routed_int8_activations = expert_activation_bits == 8;
   GlmMoeConfig::validate_config(m);
   return m;
 }

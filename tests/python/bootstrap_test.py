@@ -55,6 +55,7 @@ class BootstrapTest(unittest.TestCase):
         self.assertEqual(values["DGPP_NODES"], "127.0.0.1")
         self.assertEqual(values["DGPP_CLUSTER_CONFIG"], str(self.config))
         self.assertEqual(values["HF_HUB_CACHE"], "~/models/hub")
+        self.assertEqual(site_env.resolve_config(self.config)["http"]["bind_host"], "0.0.0.0")
         tuned = self.config.read_text().replace('"mtp": true', '"mtp": false')
         self.config.write_text(tuned)
         original = self.site.read_bytes()
@@ -118,9 +119,62 @@ class BootstrapTest(unittest.TestCase):
         values = site_env.read_env(self.site)
         self.assertEqual(values["DGPP_NODES"], "127.0.0.1")
         self.assertEqual(values["DGPP_HTTP_PORT"], "18080")
+        self.assertEqual(values["DGPP_HTTP_BIND"], "0.0.0.0")
         self.assertEqual(values["HF_HUB_CACHE"], "~/.cache/huggingface/hub")
         self.assertEqual(values["DGPP_RESIDENT_CACHE_DIR"], "~/.cache/dgpp/resident")
         self.assertFalse(any("up" in call.args[0] for call in run.call_args_list))
+
+    def test_http_bind_flag_saves_valid_addresses_and_preserves_them_on_rerun(self):
+        for address in ("127.0.0.1", "192.0.2.10", "0.0.0.0"):
+            with self.subTest(address=address):
+                self.assertEqual(setup.main([*self.args, "--configure-only", "--http-bind", address]), 0)
+                self.assertEqual(site_env.read_env(self.site)["DGPP_HTTP_BIND"], address)
+                original = self.site.read_bytes()
+                self.assertEqual(setup.main([*self.args, "--configure-only"]), 0)
+                self.assertEqual(self.site.read_bytes(), original)
+                self.assertEqual(site_env.resolve_config(self.config)["http"]["bind_host"], address)
+
+    def test_interactive_http_bind_prompt_uses_existing_value_and_saves_choice(self):
+        self.site.write_text('DGPP_HTTP_BIND="127.0.0.1"\n')
+        prompts = []
+
+        def answer(label, default=""):
+            if label.startswith("HTTP bind address"):
+                prompts.append((label, default))
+                return "0.0.0.0"
+            return default
+
+        with patch.object(sys.stdin, "isatty", return_value=True), patch.object(setup, "ask", side_effect=answer):
+            self.assertEqual(setup.main(["--template", str(self.template), "--env-file", str(self.site),
+                                         "--configure-only"]), 0)
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(prompts[0][1], "127.0.0.1")
+        self.assertEqual(site_env.read_env(self.site)["DGPP_HTTP_BIND"], "0.0.0.0")
+
+    def test_invalid_or_export_conflicting_http_bind_does_not_write_files(self):
+        for address in ("localhost", "::1", "999.1.1.1", ""):
+            with self.subTest(address=address), self.assertRaisesRegex(ValueError, "DGPP_HTTP_BIND"):
+                setup.main([*self.args, "--configure-only", "--http-bind", address])
+            self.assertFalse(self.site.exists())
+            self.assertFalse(self.config.exists())
+        with patch.dict(os.environ, {"DGPP_HTTP_BIND": "127.0.0.1"}), \
+                self.assertRaisesRegex(ValueError, "exported DGPP_HTTP_BIND"):
+            setup.main([*self.args, "--configure-only", "--http-bind", "0.0.0.0"])
+        self.assertFalse(self.site.exists())
+        self.assertFalse(self.config.exists())
+
+    def test_deployment_http_bind_wins_and_conflicting_flag_is_reported(self):
+        cfg = json.loads(self.template.read_text())
+        cfg["http"] = {"bind_host": "127.0.0.1"}
+        self.template.write_text(json.dumps(cfg))
+        with self.assertRaisesRegex(ValueError, "deployment sets http.bind_host"):
+            setup.main([*self.args, "--configure-only", "--http-bind", "0.0.0.0"])
+        self.assertFalse(self.site.exists())
+        self.assertFalse(self.config.exists())
+        self.assertEqual(setup.main([*self.args, "--configure-only", "--http-bind", "127.0.0.1"]), 0)
+        self.assertEqual(self.config.read_text(), self.template.read_text())
+        self.assertEqual(site_env.resolve_config(self.config)["http"]["bind_host"], "127.0.0.1")
+        self.assertIn("set by deployment http.bind_host", self.output.getvalue())
 
     def test_failed_prerequisites_do_not_build_download_or_start(self):
         self.fake_prerequisites(failed=1)

@@ -168,10 +168,12 @@ the resource-limit settings in
 
 ## HTTP exposure
 
-HTTP defaults to `127.0.0.1:18080`. Set `http.bind_host` and `http.port` in
-the deployment JSON to override site defaults. A specific LAN IPv4 address
-restricts the listening interface; `0.0.0.0` accepts traffic on every IPv4
-interface. The server does not enforce API keys and does not implement TLS.
+HTTP defaults to `0.0.0.0:18080`, accepting traffic on every IPv4 interface.
+Setup prompts for the bind address; `scripts/setup.sh --http-bind ADDRESS`
+sets it unattended. Choose `127.0.0.1` for local-only access or a specific
+local LAN IPv4 address for one interface. Set `http.bind_host` and `http.port`
+in the deployment JSON to override site defaults. The server does not enforce
+API keys and does not implement TLS.
 
 For individual remote access, use an SSH tunnel. For shared access, keep
 DGPP on localhost behind an authenticated TLS reverse proxy. A starting

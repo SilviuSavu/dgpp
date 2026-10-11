@@ -487,6 +487,10 @@ std::string encode_journal_settings(const WorldSettings& s) {
   }
   out += ",\"emsh\":";
   append_json_string(&out, s.embed_sharding);
+  out += ",\"mtph\":";
+  append_json_string(&out, s.mtp_head);
+  out += ",\"attw\":";
+  append_json_string(&out, s.attention_weights);
   out += std::format(",\"mss\":{},\"msrow\":{:.17g},\"msbase\":{:.17g},\"mslam\":{:.17g},\"msmin\":{},\"msad\":{},"
                      "\"msss\":{:.17g}",
                      s.mtp_schedule ? 1 : 0, s.mtp_schedule_row_ms, s.mtp_schedule_base_ms,
@@ -726,6 +730,9 @@ JournalRecord decode_journal_line(std::string_view line) {
     }
     // Records before 2026-09-13 carry no embedding sharding: replicated.
     if (const dgpp::minijson::Value* es = v.find("emsh")) s.embed_sharding = std::string(es->as_string());
+    // Records before 2026-10-09 carry no draft-head form: the checkpoint's.
+    if (const dgpp::minijson::Value* mh = v.find("mtph")) s.mtp_head = std::string(mh->as_string());
+    if (const dgpp::minijson::Value* aw = v.find("attw")) s.attention_weights = std::string(aw->as_string());
     // Records before 2026-09-14 carry no scheduled verify depth: off.
     if (const dgpp::minijson::Value* mss = v.find("mss")) {
       s.mtp_schedule = mss->as_int() != 0;
@@ -764,7 +771,9 @@ JournalRecord decode_journal_line(std::string_view line) {
         (s.dense_weights != "checkpoint" && s.dense_weights != "fp8") ||
         !parse_bf16_residency(s.bf16_weights, nullptr) ||
         (s.prefill != "bounded" && s.prefill != "exact") ||
-        (s.embed_sharding != "replicated" && s.embed_sharding != "vocab"))
+        (s.embed_sharding != "replicated" && s.embed_sharding != "vocab") ||
+        (s.mtp_head != "checkpoint" && s.mtp_head != "fp8") ||
+        (s.attention_weights != "checkpoint" && s.attention_weights != "int4"))
       throw std::runtime_error("journal: settings record with impossible values");
     return rec;
   }

@@ -9,6 +9,7 @@
 //                      --ids 1,2,3,... [--topk K] [--layers N] [--dump-states FILE]
 //                      [--world W --rank R --peer HOST --port N] [--resident]
 //                      [--image-dir DIR|off] [--lat-slot-bytes N]
+//                      [--attention-weights checkpoint|int4] (engine.attention_weights)
 //                      [--teacher-file FILE] (scores every prefill position;
 //                        scripts/fabric_logprob.py --prefill joins TP slices)
 //
@@ -74,6 +75,11 @@ int main(int argc, char** argv) {
       else if (a == "--text") text = next(i);              // tokenized with the checkpoint's tokenizer
       else if (a == "--teacher-file")
         teacher_file = next(i);
+      else if (a == "--attention-weights") {
+        const std::string f = next(i);
+        if (f != "checkpoint" && f != "int4") throw std::runtime_error("--attention-weights: checkpoint or int4");
+        dgpp::GlmDsaLayerStream::set_attention_weights_int4(f == "int4");
+      }
       else if (a == "--decode-steps") decode_steps = std::stoi(next(i));  // greedy steps after the forward, audited
       else if (a == "--topk") topk = std::stoi(next(i));
       else if (a == "--layers") layers = std::stoi(next(i));

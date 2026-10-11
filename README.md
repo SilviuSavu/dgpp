@@ -29,6 +29,8 @@ over RoCE. Each quant links to its specific Hugging Face model card.
 | Qwen3.8-Flash-Next | [RadixArk/Qwen3.8-Flash-Next-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-Flash-Next-NVFP4) | 1, 2 | [One node](deploy/cluster_qwen-3.8-flash-next_nvfp4-radixark_w1.example.json) (tuned: 4K prefill chunks with matching prefill budgets, MTP depth 2), [two nodes](deploy/cluster_qwen-3.8-flash-next_nvfp4-radixark_w2.example.json) (same NVFP4 format and engine configuration as the NVIDIA release) |
 | GLM-4.7 | [nvidia/GLM-4.7-NVFP4](https://huggingface.co/nvidia/GLM-4.7-NVFP4) | 4 | [Four nodes](deploy/cluster_glm-4.7_nvfp4_w4.example.json) |
 | GLM-5.3 | [HawkBearPig/GLM-5.3-Int4-Int8Mix-RTN-g64](https://huggingface.co/HawkBearPig/GLM-5.3-Int4-Int8Mix-RTN-g64) | 4 | [Four nodes](deploy/cluster_glm-5.3_int4-int8_w4.example.json) |
+| GLM-5.3 | [HawkBearPig/GLM-5.3-NF4I8-GPTQ-H32-g128](https://huggingface.co/HawkBearPig/GLM-5.3-NF4I8-GPTQ-H32-g128) | 4 | [Four nodes](deploy/cluster_glm-5.3_nf4i8_w4.example.json) (272K FP8 K/V pool) |
+| GLM-5.3 | [HawkBearPig/GLM-5.3-Mixed346-GPTQ-H32-A8-g128](https://huggingface.co/HawkBearPig/GLM-5.3-Mixed346-GPTQ-H32-A8-g128) | 4 | [Four nodes](deploy/cluster_glm-5.3_mixed346_w4.example.json) (272K FP8 K/V pool) |
 | DeepSeek-V4.1-Flash | [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) | 4 | [Four nodes](deploy/cluster_deepseek-v4.1-flash_mxfp4-fp8_w4.example.json) |
 | MiMo-V2.6-Flash | [XiaomiMiMo/MiMo-V2.6-Flash-RL](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL) | 2, 4 | [Two nodes](deploy/cluster_mimo-v2.6-flash_mxfp4-fp8_w2.example.json), [four nodes](deploy/cluster_mimo-v2.6-flash_mxfp4-fp8_w4.example.json) |
 | DeepSeek-V4-Flash | [deepseek-ai/DeepSeek-V4-Flash-0731](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) | 2, 4 | [Two nodes](deploy/cluster_deepseek-v4-flash_mxfp4-fp8_w2.example.json), [four nodes](deploy/cluster_deepseek-v4-flash_mxfp4-fp8_w4.example.json) |
@@ -229,13 +231,15 @@ and links to the raw results and reproduction commands.
 
 ## Status
 
-As of 2026-10-04, the source tree has fifteen measured deployment templates
+As of 2026-10-10, the source tree has twenty-two measured deployment templates
 covering eight model architectures on one, two or four Sparks. The shared
 engine provides graph decode, transactional MTP, row-batched execution,
 grouped prefill, prefix caching, deterministic multi-rank scheduling and the
 OpenAI-compatible service. Current quantized paths cover FP8, NVFP4, MXFP4,
-full GLM-5.3's packed int4/int8 format and the Qwen3.8 AutoRound int4/int8
-hybrid (GPTQ layout, group 128, served as packed). Qwen NVFP4 runs on one or two Sparks by
+full GLM-5.3's packed int4/int8 format and its two GPTQ re-encodings (NF4I8:
+a sixteen-level codebook per 128 in a Hadamard-rotated basis; Mixed346: 3/4/6-bit
+codebook experts with int8 activation codes on int8 tensor cores), and the
+Qwen3.8 AutoRound int4/int8 hybrid (GPTQ layout, group 128, served as packed). Qwen NVFP4 runs on one or two Sparks by
 mapping its n-gram table from NVMe and encoding the dense stack to FP8 at load.
 
 The Qwen sixteen-slot decode graphs and prefill continuation are implemented as
@@ -299,7 +303,9 @@ Add `--start` to launch after all checks pass:
 ./scripts/setup.sh --start
 ```
 
-The API defaults to localhost and has no authentication or TLS. Wait for `READY`
+The API defaults to `0.0.0.0:18080` (all IPv4 interfaces). Setup asks for the
+HTTP bind address; `--http-bind 127.0.0.1` selects local-only access. The server
+has no authentication or TLS. Wait for `READY`
 before sending requests. For unattended setup, read-only checks, offline cache
 sync and the manual walkthrough, see [Getting started](docs/getting-started.md).
 Use `./scripts/setup.sh --help` for all options.
@@ -378,7 +384,7 @@ scripts' environment and generated server config.
 | `DGPP_SSH_USER` | Peer login for binary staging, process control, diagnostics and checkpoint sync. Needs SSH-key access and write access to the configured directories. | current login when empty or absent |
 | `DGPP_CLUSTER_CONFIG` | Default deployment filename, saved by guided setup. An explicit `--config` takes precedence. | legacy four-node Flash hybrid filename |
 | `DGPP_HTTP_PORT` | Default client-facing API TCP port on rank 0; deployment `http.port` overrides it. | 18080 |
-| `DGPP_HTTP_BIND` | Default IPv4 listening address on rank 0; deployment `http.bind_host` overrides it. Keep localhost unless you have arranged access protection. | `127.0.0.1` |
+| `DGPP_HTTP_BIND` | Default IPv4 listening address on rank 0; deployment `http.bind_host` overrides it. Setup prompts for it; `--http-bind` sets it unattended. | `0.0.0.0` |
 | `DGPP_FABRIC_PORT` | Rank-0 TCP rendezvous listener used to establish the inter-node transport. Peers must reach it; clients do not use it. Keep it private to the cluster. | 29970 |
 | `DGPP_JOURNAL_PORT` | Rank-0 TCP listener that distributes ordered scheduler operations to peers. Must differ from the fabric/API ports; keep it private to the cluster. | 29971 |
 | `DGPP_LOG_DIR` | Base directory on rank 0 for logs, process records and collected peer logs. The launcher adds a deployment-specific subdirectory. | `~/dgpp/log` |
@@ -404,6 +410,10 @@ Log and staging directories are namespaced by deployment-file path;
 is used as-is. `up` refuses an existing deployment unless `--replace` is given;
 `down` without `--config` stops every recorded deployment that is running;
 cleanup uses recorded process identity, never a binary-name kill.
+During startup, the launcher prints the rank 0 log path and reports elapsed
+time and the latest log line every ten seconds while waiting for readiness.
+If rank 0 exits, it reports the exit status and full trailing log lines
+within the two-second polling interval, then cleans up the deployment's peers.
 
 The launcher resolves the deployment and site settings into
 `<log_dir>/cluster.resolved.json` when starting the service. Both the head
@@ -431,7 +441,7 @@ templates set their serving options explicitly.
 |---|---|---|---|
 | `model` | yes | Exact Hugging Face repository ID, such as `HawkBearPig/GLM-5.3-Flash-NVFP4-FP8`. Selects the checkpoint tensors, tokenizer and chat template. It is not a local filesystem path or a generic quant name. | — |
 | `world_size` | yes | Number of participating nodes/ranks: 1, 2 or 4. Uses the first N entries of `DGPP_NODES`; each rank stores its tensor-parallel share in memory. Choose a supported model/world pair, not an arbitrary smaller number to save machines. | — |
-| `http.bind_host` | no | IPv4 address on rank 0 that accepts API connections. `127.0.0.1` is local-only; a LAN address exposes that interface; `0.0.0.0` exposes all IPv4 interfaces. The server has no authentication/TLS. Does not select the RoCE interface. | `DGPP_HTTP_BIND`, otherwise `127.0.0.1` |
+| `http.bind_host` | no | IPv4 address on rank 0 that accepts API connections. `127.0.0.1` is local-only; a LAN address exposes that interface; `0.0.0.0` exposes all IPv4 interfaces. The server has no authentication/TLS. Does not select the RoCE interface. | `DGPP_HTTP_BIND`, otherwise `0.0.0.0` |
 | `http.port` | no | TCP port clients use for the API, in 1–65535. Change it if the default is occupied, then update client URLs. Overrides the site HTTP port and must differ from fabric/journal ports in a multi-node deployment. | `DGPP_HTTP_PORT`, otherwise 18080 |
 | `http.max_body_bytes` | no | Maximum serialized HTTP request body in bytes, as a positive integer. Allows large document prefills and agent histories; independent of the model's token/KV capacity. Oversized requests receive HTTP 413 based on Content-Length, before tokenization. Buffers grow with received data, so this does not preallocate the limit per connection. The binary flag `--http-max-body-bytes` overrides it. | 268435456 (256 MiB) |
 | `http.sse_ping_interval` | no | Whole seconds of stream silence before sending an SSE keep-alive comment. Accepts 1–2147483647; `-1` disables pings. Covers queued requests, prefill and gaps between output chunks on rank 0. `--sse-ping-interval` overrides the file; request `sse_ping_interval` overrides the server setting. Engine deadlines are unchanged. | 30 |
@@ -449,6 +459,8 @@ Startup checks the combined memory plan before loading.
 | `engine.max_concurrency` | no | Maximum actively executing requests, not TCP connections or queued requests. More slots can improve aggregate throughput but use more state/scratch memory and may increase per-request latency. Allowed range is 1–16, subject to model/MTP row limits below. | 8 |
 | `engine.kv_capacity` | no | Shared context-token pool on each rank, across active requests—not a separate allowance for every request. A prompt and its generated answer must fit. Increase for longer contexts or more simultaneous context; memory use increases and allocation is rounded to model block boundaries. | 8192 tokens |
 | `engine.kv_dtype` | no | GLM-5.3 latent-cache precision: `bf16`, `fp8`, or `fp4`; the MiMo-V2.6-Flash K/V cache takes `bf16` or `fp8` (e4m3 rows with one scale per head row, half the bytes). Lower precision reduces cache storage at a numerical-accuracy cost; it does not quantize model weights. The GLM index cache stays FP8. Qwen, GLM-4.7 and DeepSeek K/V caches remain BF16. | `bf16` |
+| `engine.mtp_head` | no | Full GLM-5.3 draft-block head: `checkpoint` reads the lm head as the main step does (its 12-bit form under `bf16_weights`); `fp8` reads a block-FP8 copy encoded at load (e4m3, 128×128 fp32 scales, the FP8 releases' recipe; +0.22 GiB per rank at world 4). The verifier keeps the main head, so the served distribution is unchanged; only the draft's acceptance can move (measured: unchanged, the draft head 1.36 → 1.05 ms per pass, 0.5 % of the step). Other families ignore it. | `checkpoint` |
+| `engine.attention_weights` | no | Full GLM-5.3 attention projections' resident form: `checkpoint` as shipped (int8 g64); `int4` re-encodes q_a/kv_a, q_b and o_proj to int4 g64 at load with the RTN recipe (kv_b stays int8): −2.1 GB per MTP pass per rank and −0.9 GiB resident at world 4, NOT lossless — measure the quality cost with the teacher-forced gate before shipping it. Other families ignore it. | `checkpoint` |
 | `engine.embed_sharding` | no | Full GLM-5.3 and DeepSeek embedding/head placement: `replicated` keeps the full table on every rank; `vocab` keeps each rank's vocabulary slice and folds token lookups. The full-GLM template uses `vocab` to save 1.33 GiB/rank; the DeepSeek template retains `replicated`. Other families ignore it. | `replicated` |
 | `engine.default_max_tokens` | no | Answer-token budget for requests that omit `max_tokens`. Clients may supply their own value; this is not a global hard limit. A larger default also reserves more context space under full admission (`kv_capacity` must cover the prompt plus this budget, or the request is refused). Every deployment template sets 32768: agent clients such as Hermes send no `max_tokens`, and a thinking model's reasoning alone exceeds a few hundred tokens. | 256 |
 | `engine.queue_limit` | no | Maximum requests waiting for an execution slot or memory budget. Additional arrivals receive HTTP 503 `overloaded`. Increase to tolerate bursts, at the cost of longer waits—not higher execution capacity. | 64 |

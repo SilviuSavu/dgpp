@@ -18,7 +18,7 @@ SITE_KEYS = (
     "DGPP_HTTP_BIND", "DGPP_ROCE_DEVICES", "DGPP_ROCE_GID_INDICES",
     "HF_HOME", "HF_HUB_CACHE", "DGPP_RESIDENT_CACHE_DIR", "DGPP_NODE_OVERRIDES",
     "DGPP_BUILD_DIR", "DGPP_DATA_DIR",
-    "DGPP_LOG_LEVEL", "DGPP_MLOCK",
+    "DGPP_LOG_LEVEL", "DGPP_MLOCK", "DGPP_NO_SWAP",
     # The engine's L2 weight-prefetch knobs (src/kernels/l2_prefetch.hpp); site
     # settings so an A/B runs with the same setting on every rank.
     # The bus timeline (DGPP_BUS_TIMELINE=1: the graph windows' and the prefill
@@ -29,7 +29,7 @@ SITE_KEYS = (
     "DGPP_BUS_TIMELINE", "DGPP_DSV41_DENSE_GEMV", "DGPP_DENSE_GEMV_ROWS", "DGPP_DSV41_EAGER_FOLD",
 )
 NODE_KEYS = ("DGPP_ROCE_DEVICES", "DGPP_ROCE_GID_INDICES", "HF_HUB_CACHE", "DGPP_RESIDENT_CACHE_DIR",
-    "DGPP_LOG_LEVEL", "DGPP_MLOCK",
+    "DGPP_LOG_LEVEL", "DGPP_MLOCK", "DGPP_NO_SWAP",
     # The engine's L2 weight-prefetch knobs (src/kernels/l2_prefetch.hpp): an A/B runs
     # with the same setting on every rank.
     "DGPP_BUS_TIMELINE", "DGPP_DSV41_DENSE_GEMV", "DGPP_DENSE_GEMV_ROWS", "DGPP_DSV41_EAGER_FOLD",
@@ -38,7 +38,7 @@ DEFAULTS = {
     "DGPP_HTTP_PORT": "18080", "DGPP_FABRIC_PORT": "29970",
     "DGPP_JOURNAL_PORT": "29971", "DGPP_LOG_DIR": "~/dgpp/log",
     "DGPP_STAGE_DIR": "/tmp/bus4", "DGPP_RELEASE_DIR": "~/dgpp/releases",
-    "DGPP_HTTP_BIND": "127.0.0.1",
+    "DGPP_HTTP_BIND": "0.0.0.0",
 }
 
 
@@ -240,6 +240,8 @@ def node_environments(values, nodes=None):
         env = {**common, **overrides.get(host, {})}
         if any(not isinstance(value, str) or any(c in value for c in "\0\r\n") for value in env.values()):
             raise ValueError(f"node settings for {host} must be single-line strings")
+        if "DGPP_NO_SWAP" in env and env["DGPP_NO_SWAP"] not in ("0", "1"):
+            raise ValueError(f"DGPP_NO_SWAP for {host} must be 0 or 1")
         devices = env.get("DGPP_ROCE_DEVICES", "").split()
         if len(devices) > 2:
             raise ValueError(f"at most two RoCE devices are supported for {host}")
@@ -278,6 +280,13 @@ def cache_environment(values=None, rank=0):
     """Site cache defaults plus a node override, for local preparation tools."""
     values = settings() if values is None else values
     return {**values, **(rank_environment(rank, values) if values.get("DGPP_NODES") else {})}
+
+
+def server_config(cfg):
+    """Keep launcher-only policy out of the engine's strict JSON schema."""
+    return {**cfg, "node_env": [
+        {key: value for key, value in env.items() if key != "DGPP_NO_SWAP"}
+        for env in cfg["node_env"]]}
 
 
 def shell_prefix(env):
@@ -395,7 +404,7 @@ def main():
     elif args.command == "http-port":
         print(http_port(values))
     elif args.command == "resolve":
-        print(json.dumps(resolve_config(path, values), indent=2))
+        print(json.dumps(server_config(resolve_config(path, values)), indent=2))
     else:
         world = args.world if args.world is not None else deployment(path)["world_size"]
         nodes = selected_nodes(values, world)

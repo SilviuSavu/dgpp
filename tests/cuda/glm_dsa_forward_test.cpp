@@ -366,7 +366,14 @@ int run_dump_parity(const std::string& dir, const std::string& dump_path) {
       std::printf(" t%d %.3g%s", rows[static_cast<size_t>(i)].second, rows[static_cast<size_t>(i)].first,
                   excluded[static_cast<size_t>(rows[static_cast<size_t>(i)].second)] ? "(flip)" : "");
     std::printf("\n");
-    if (s.total > 0 && (s.l2 > 0.01 || static_cast<double>(s.hard) / s.total > 0.005)) ok = false;
+    // The per-layer budget: 0.01 relative l2, or 0.015 under the int8
+    // activation contract (the Mixed346 checkpoint): its code flips roughly
+    // double a layer's response to upstream noise (glm_moe_test's
+    // sensitivity probe: row l2 0.0044 per input ulp against 0.0025 for the
+    // bf16-activation formats), so the reference's own reassociation reaches
+    // the output amplified; the final read's budget was 0.015 already.
+    const double layer_budget = cfg.expert_activation_bits == 8 ? 0.015 : 0.01;
+    if (s.total > 0 && (s.l2 > layer_budget || static_cast<double>(s.hard) / s.total > 0.005)) ok = false;
   }
   // ---- the final read ---------------------------------------------------------
   const Dump::Tensor& fh = dump.tensor("final_hidden");
@@ -460,10 +467,13 @@ int run_dump_parity(const std::string& dir, const std::string& dump_path) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string fixture, prefill_fixture, smoke, checkpoint, dump;
+  std::string fixture, nf4i8_fixture, attn4_fixture, m346_fixture, prefill_fixture, smoke, checkpoint, dump;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--write-fixture" && i + 1 < argc) fixture = argv[++i];
+    else if (a == "--write-fixture-nf4i8" && i + 1 < argc) nf4i8_fixture = argv[++i];
+    else if (a == "--write-fixture-attn4" && i + 1 < argc) attn4_fixture = argv[++i];
+    else if (a == "--write-fixture-m346" && i + 1 < argc) m346_fixture = argv[++i];
     else if (a == "--write-prefill-fixture" && i + 1 < argc)
       prefill_fixture = argv[++i];
     else if (a == "--smoke" && i + 1 < argc) smoke = argv[++i];
@@ -489,10 +499,31 @@ int main(int argc, char** argv) {
       std::printf("[ OK ] wrote the fixture to %s\n", fixture.c_str());
       return 0;
     }
+    if (!attn4_fixture.empty()) {
+      // The int4-attention candidate: the attention projections packed at 4
+      // bits (the compressed-tensors contract), the shared expert int8.
+      glmdsafx::write_fixture(glmdsafx::tiny_config(5, 1, true, false, 4), attn4_fixture, false, 4);
+      std::printf("[ OK ] wrote the int4-attention fixture to %s\n", attn4_fixture.c_str());
+      return 0;
+    }
+    if (!m346_fixture.empty()) {
+      // The Mixed346 contract's fixture (tests/cuda/glm_dsa_fixture.hpp): every
+      // expert form on every packed layer, int8 activation codes.
+      glmdsafx::write_fixture(glmdsafx::tiny_config(5, 1, true, false, 8, true), m346_fixture, false, 8, true);
+      std::printf("[ OK ] wrote the mixed346 fixture to %s\n", m346_fixture.c_str());
+      return 0;
+    }
+    if (!nf4i8_fixture.empty()) {
+      // The NF4I8 contract's fixture (codebook routed experts in the
+      // H32-rotated basis, a 512-wide inter): the same gates run on it.
+      glmdsafx::write_fixture(glmdsafx::tiny_config(5, 1, true, true), nf4i8_fixture, true);
+      std::printf("[ OK ] wrote the nf4i8 fixture to %s\n", nf4i8_fixture.c_str());
+      return 0;
+    }
     if (!smoke.empty()) return run_smoke(smoke);
     if (!checkpoint.empty() && !dump.empty()) return run_dump_parity(checkpoint, dump);
     std::fprintf(stderr,
-                 "usage: --write-fixture DIR | --write-prefill-fixture DIR | --smoke DIR | "
+                 "usage: --write-fixture DIR | --write-fixture-nf4i8 DIR | --write-fixture-attn4 DIR | --write-fixture-m346 DIR | --write-prefill-fixture DIR | --smoke DIR | "
                  "--checkpoint-dir DIR --dump-file FILE\n");
     return 2;
   } catch (const std::exception& e) {

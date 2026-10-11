@@ -49,6 +49,112 @@ The history by milestone. The dated engineering record in
   the chain). The confidence-scheduled depth (the selector's confidence
   is published) is the follow-up that would pick the shallow chat steps
   and the deep json steps per request.
+- **Full GLM-5.3: `engine.attention_weights`** (2026-10-09): `int4`
+  re-encodes the checkpoint's int8 g64 q_a/kv_a, q_b and o_proj rows to
+  int4 g64 at load with the RTN recipe (kv_b keeps its int8 form; the
+  resident image is keyed by the form through the family's
+  `loader_format()`, so the first boot under it writes its own image) —
+  a measuring instrument for the attention-bytes lever, NOT lossless: on
+  the four nodes it reads a 61.1 ms pass against 65.8–66.6 (o_proj's GEMV
+  7.5 → 3.8 ms; q_a/kv_a and q_b barely move, they are L2-fed by the
+  boundary prefetcher), −1.74 GiB resident, and costs +0.030 nat on the
+  hard text (perplexity 10.25 → 10.57, top-1 50.3 → 49.9 %) — the RTN floor
+  a calibrated 4- or 6-bit attention has to beat; o_proj is the exposed read. `checkpoint` (the default) serves the
+  weights as shipped. The diagnostic forward check takes
+  `--attention-weights` for the teacher-forced gate.
+- **Full GLM-5.3: the draft head in block FP8** (2026-10-09, `engine.mtp_head`):
+  `fp8` encodes the lm head's rows to block FP8 at load (e4m3, 128 × 128
+  fp32 scales — the FP8 releases' recipe, `loaders/fp8_quant.hpp`) and
+  the draft block reads that copy through the fp8 scale-GEMM core while
+  the verifier keeps the main head in its 12-bit form — the served
+  distribution is unchanged by construction (greedy transcripts identical
+  across the two forms on the fabric), only the draft's proposals come from
+  the narrower head. +0.22 GiB per rank at world 4 (the memory plan's
+  weights line). On the four nodes (nsys per-step breakdown, one request, MTP depth 1):
+  the draft head's GEMV 1.36 ms in the 12-bit form, 1.05 ms in FP8 (238 MB
+  at 227 GB/s) — 0.3 ms per pass, 0.5 %, under the load gate's run-to-run
+  noise; acceptance by class identical to the hundredth of a token per
+  pass. Opt-in, not in the template: 0.22 GiB buys ~4K tokens of fp8
+  context there. `checkpoint` (the
+  default) keeps the draft on the main head's form.
+- **Full GLM-5.3 in the Mixed346 GPTQ H32 A8 g128 checkpoint** (2026-10-09/10,
+  `HawkBearPig/GLM-5.3-Mixed346-GPTQ-H32-A8-g128`,
+  [card](docs/model_cards/GLM-5.3-Mixed346-GPTQ-H32-A8-g128.md)): the
+  Int4/Int8 checkpoint with its routed experts re-encoded expert by expert
+  at 3, 4 or 6 bits (gate/up at one width, down at its own; a Gaussian
+  eight-level codebook at 3 bits, the NF4I8 codebook at 4, signed INT6 at
+  6; bf16 scales per 128, GPTQ in the H32-rotated basis) with INT8 expert
+  activation codes (one fp32 scale per 128 rotated values), 116 experts
+  kept in the Int4/Int8 form — 4.22 GiB less per rank than Int4/Int8 and
+  19 % less divergence from BF16 by the publisher's table. A fourth packed
+  scale format (`kPackedScaleBf16G128Mixed346`: dense 3/4/6-bit index
+  streams, `packed_bits_allowed`) parsed from `quant_method: dgpp_mixed346`
+  with its two sidecars (the baseline compressed-tensors block and the
+  per-expert recipe, or both inline), every tensor named by its own form in
+  the binding; the loader slices the dense streams at the 128-group; a
+  new GEMV core (`kernels/packq_a8_gemv.cuh`: a 16-byte piece a lane at 4
+  bits, a 48-byte piece — a group, or half of one — at 3 and 6 bits loaded
+  cooperatively and swapped through a per-warp shared tile, dp4a int32
+  group dots, one fp32 scale product per group, the staged codes at a
+  conflict-free 132-byte stride) under mixed-form slot and grouped kernels;
+  the H32-then-int8 activation quantizer (`kernels/hadamard32.cu`), fused
+  into the post-attention norm for the token rows
+  (`glm_rmsnorm_bf16_quant_int8`); an int8 tensor-core prefill tile
+  (`packq_gemm.cu` `wide_tile_i8`: the rows' codes against int8 levels on
+  mma m16n8k32 s8, each 128-code group an exact int32 dot scaled once; the
+  fallback experts' tiles stay on the bf16 group-64 chain in the same
+  launch) with the rows' and the widths' lines prefetched into L2, and the
+  tile list for every Mixed346 layer. Host and Python oracles, the fixture
+  gates (TP, engine graph, decode, parity) with budgets stated for the int8
+  contract's doubled sensitivity to upstream noise, the slot microbench
+  (`--m346 FORM|census`) and its `--prefill` chain mode: the slot path at
+  the int4 core's bandwidth at every width, the gate tile 15 % under the
+  int4 tile's time, the 2K-token chain level with it. On the four nodes
+  (2026-10-10): decode 62.7 ms per pass at one request and 236 at eight
+  (Int4/Int8 63.6 / 252, NF4I8 64.0 / 253, the same MTP acceptance), cold
+  prefill 3.906 / 17.943 / 76.714 s at 2K / 8K / 32K (Int4/Int8 3.896 /
+  17.866 / 76.439), 108 ms per pass at 256K context; teacher-forced 2.3284
+  nat/token between the two references.
+- **Full GLM-5.3 in the NF4I8 GPTQ H32 g128 checkpoint** (2026-10-08/09,
+  `HawkBearPig/GLM-5.3-NF4I8-GPTQ-H32-g128`, [card](docs/model_cards/GLM-5.3-NF4I8-GPTQ-H32-g128.md)):
+  the Int4/Int8 checkpoint with its routed experts re-encoded as four-bit
+  indices into a sixteen-level INT8 codebook (bf16 scale per 128, GPTQ) in
+  a block-32 Hadamard-rotated input basis — 2.64 GiB less per rank and 22 %
+  less divergence from BF16 by the publisher's teacher-forced table. A
+  third packed scale format (`kPackedScaleBf16G128Nf4i8`), parsed from the
+  checkpoint's `quant_method: dgpp_nf4i8` block and refused on any drift
+  of the codebook, group, rotation or layer range; the loader slices at
+  the format's group; the GEMV core decodes the codebook with two
+  byte-permute lookups into its exact integer × bf16-scale chain, the
+  tensor-core prefill decodes the levels to their bf16 patterns the same
+  way (no integer-to-float conversions on the decode path); the H32
+  rotation is one kernel (`kernels/hadamard32.cu`: fp32 butterflies, one
+  bf16 rounding, the op order of the host oracle and the Python
+  reference) applied once per row — into a side buffer the decode slots
+  read and in place on the gathered routed rows and the SwiGLU rows of
+  the prefill chains. A first form rotated the staged row inside every
+  slot-kernel block (64 blocks a slot repeating the same rotation) and
+  converted the levels through int-to-float on the tensor-core path; on
+  the fabric the sixteen-row step read +4 % against the Int4/Int8
+  checkpoint, now level: on today's binary the two checkpoints measure the
+  same step at one and at eight requests (C8 ratio 1.000) and the same
+  cold prefill (3.87 vs 3.90 s at 2K; the format saves 1.1 % of a decode
+  step's bytes, 8 of 256 experts a token, and the lookup decode changed
+  no prefill cell). Oracles:
+  the MoE host reference and both Python references carry the codebook
+  and the rotation; tests at every level (kernel, layer, synthetic
+  checkpoint forward/decode/TP/engine, the landed checkpoint's binding).
+  Template `deploy/cluster_glm-5.3_nf4i8_w4.example.json`: eight slots,
+  MTP depth 1, a 272K-token fp8 K/V pool (plan 110.43 GiB; the
+  280K shape boots only on a settled node — the process holds ~3.5 GiB
+  beyond the plan at listening). On the four
+  nodes: the Int4/Int8 checkpoint's decode step at one request and at
+  every context bucket to 256K, C1 27.1–30.6 engine tokens/s and C8 52.6–56.4 wall
+  tokens/s over the five classes (the Int4/Int8 rows 27.4–30.5 / 52.9–55.7),
+  cold prefill 3.87 / 17.9 / 76.5 s at 2K / 8K / 32K; teacher-forced on the
+  hard text 2.3276 vs 2.3295 nat/token (inside the standard error);
+  HumanEval 157/164, GSM8K 294/300, schema extraction 100/100
+  at `reasoning_effort` low.
 - **The L2 weight prefetcher's knobs are engine keys** (2026-10-05):
   `engine.l2_prefetch` (on/off), `engine.l2_prefetch_form` (`load` the
   bytes, `lines` one L2 prefetch per 128-byte line, `touch` one line per
@@ -126,6 +232,15 @@ The history by milestone. The dated engineering record in
   site in the model, and the four-node shard widths are where the plain
   T=1 world pays its 10 %. The next kernel item: the decode form at one to
   four rows on narrow shards.
+- **Serve: completion response timings** (2026-10-05; compatibility follow-up
+  2026-10-08): chat and legacy responses carry a top-level llama.cpp-style
+  `timings` object. Streams report timings on the final usage or terminal
+  chunk, including when usage is disabled. Prompt rates count uncached tokens
+  and exclude the initial admission queue; decode rates exclude the first
+  token supplied by each prefill. Existing usage, JSON metrics, Prometheus
+  measurements and throughput logs keep their definitions. See
+  [the API contract](docs/openai-compatibility.md#completion-timings-dgpp-extension)
+  and [validation record](benchmarks/results/2026-10-08-completion-timings.md).
 - **Qwen3.8-27B: a request's logits are the same alone, at every verify
   depth and in a batch** (2026-10-05): six row-count dependences in the
   decode step, found after the campaign with the solo-vs-co-tenant probe

@@ -52,14 +52,22 @@ struct Fixture {
   }
 };
 
-Fixture write_fixture() {
+// `nf4i8`: the NF4I8 contract's fixture (codebook routed experts under
+// `weight_indices`, bf16 scales per 128, a 512-wide inter so a world-4
+// slice holds a whole group).
+// `m346` (2026-10-09): the Mixed346 contract's fixture — every routed
+// expert of a packed layer in its own form (3-, 4- or 6-bit gate/up and
+// down, or the baseline int4 g64 triple), bf16 scales per 128.
+Fixture write_fixture(bool nf4i8 = false, bool m346 = false) {
   Fixture fx;
-  fx.cfg = glmdsafx::tiny_config();
-  fx.dir = (fs::current_path() / "glm_dsa_loader_fixture").string();
-  glmdsafx::write_fixture(fx.cfg, fx.dir);
+  fx.cfg = glmdsafx::tiny_config(5, 1, true, nf4i8, 8, m346);
+  fx.dir = (fs::current_path() / (m346 ? "glm_dsa_loader_fixture_m346" : nf4i8 ? "glm_dsa_loader_fixture_nf4i8" : "glm_dsa_loader_fixture")).string();
+  glmdsafx::write_fixture(fx.cfg, fx.dir, nf4i8, 8, m346);
   fx.table = dgpp::glm_dsa_expected_text_tensors(fx.cfg);
   return fx;
 }
+// The three contracts' fixtures: {nf4i8, m346}.
+constexpr std::pair<bool, bool> kFixtureKinds[] = {{false, false}, {true, false}, {false, true}};
 
 std::vector<uint8_t> device_bytes(const void* dev, size_t n) {
   std::vector<uint8_t> h(n);
@@ -85,22 +93,29 @@ void expect_device_equals(const void* dev, const std::vector<uint8_t>& want, con
   require(got == want, what + ": resident bytes differ from the checkpoint slice");
 }
 
-// A packed view against the checkpoint's row / column slice of `base`.
+// A packed view against the checkpoint's row / column slice of `base`:
+// the triple's form (the scale record's scale_fmt) names the words tensor
+// and the group.
 void check_packed(const Fixture& fx, const dgpp::GlmPackedMatrix& m, const std::string& base, bool rows_slice,
                   int64_t start, int64_t count, const std::string& tag) {
-  const auto& ep = fx.expected(base + ".weight_packed");
+  const auto& es = fx.expected(base + ".weight_scale");
+  const int fmt = es.scale_fmt;
+  const int64_t g = dgpp::packed_scale_group(fmt);
+  const std::string words = base + dgpp::glm_dsa_packed_words_suffix(fmt);
+  const auto& ep = fx.expected(words);
   const int bits = ep.bits;
   const int64_t N = ep.shape[0], K = ep.shape[1] * 32 / bits;
-  const size_t wpr = static_cast<size_t>(K * bits / 32) * 4, spr = static_cast<size_t>(K / 64) * 2;
+  const size_t wpr = static_cast<size_t>(K * bits / 32) * 4, spr = static_cast<size_t>(K / g) * 2;
   require(m.bits == bits, tag + " width");
+  require(m.scale_fmt == fmt, tag + " scale format");
   if (rows_slice) {
     require(m.rows == count && m.cols == K, tag + " geometry");
-    expect_device_equals(m.packed, host_rows(fx.bytes(base + ".weight_packed"), wpr, start, count), tag + " word rows");
+    expect_device_equals(m.packed, host_rows(fx.bytes(words), wpr, start, count), tag + " word rows");
     expect_device_equals(m.scales, host_rows(fx.bytes(base + ".weight_scale"), spr, start, count), tag + " scale rows");
   } else {
     require(m.rows == N && m.cols == count, tag + " geometry");
-    expect_device_equals(m.packed, host_cols(fx.bytes(base + ".weight_packed"), N, wpr, start * bits / 8, count * bits / 8), tag + " word cols");
-    expect_device_equals(m.scales, host_cols(fx.bytes(base + ".weight_scale"), N, spr, start / 64 * 2, count / 64 * 2), tag + " scale cols");
+    expect_device_equals(m.packed, host_cols(fx.bytes(words), N, wpr, start * bits / 8, count * bits / 8), tag + " word cols");
+    expect_device_equals(m.scales, host_cols(fx.bytes(base + ".weight_scale"), N, spr, start / g * 2, count / g * 2), tag + " scale cols");
   }
 }
 
@@ -258,7 +273,8 @@ void check_layer(const Fixture& fx, const GlmDsaLayerStream& s, const dgpp::GlmD
 }  // namespace
 
 DGPP_TEST(glm_dsa_loader_slices_every_class_byte_exact_at_worlds_1_2_4) {
-  const Fixture fx = write_fixture();
+  for (const auto& [nf4i8, m346] : kFixtureKinds) {
+  const Fixture fx = write_fixture(nf4i8, m346);
   const int layers = fx.cfg.num_hidden_layers + 1;
   for (const int world : {1, 2, 4}) {
     for (int rank = 0; rank < world; ++rank) {
@@ -274,6 +290,7 @@ DGPP_TEST(glm_dsa_loader_slices_every_class_byte_exact_at_worlds_1_2_4) {
         s.release_layer();
       }
     }
+  }
   }
 }
 
@@ -317,8 +334,9 @@ DGPP_TEST(glm_dsa_loader_globals_slices) {
 }
 
 DGPP_TEST(glm_dsa_loader_resident_mode_and_image_round_trip) {
-  const Fixture fx = write_fixture();
-  const fs::path cache = fs::current_path() / "glm_dsa_loader_image_cache";
+  for (const auto& [nf4i8, m346] : kFixtureKinds) {
+  const Fixture fx = write_fixture(nf4i8, m346);
+  const fs::path cache = fs::current_path() / (m346 ? "glm_dsa_loader_image_cache_m346" : nf4i8 ? "glm_dsa_loader_image_cache_nf4i8" : "glm_dsa_loader_image_cache");
   fs::remove_all(cache);
   const std::string saved = GlmDsaLayerStream::resident_image_dir();
   GlmDsaLayerStream::set_resident_image_dir(cache.string());
@@ -376,6 +394,7 @@ DGPP_TEST(glm_dsa_loader_resident_mode_and_image_round_trip) {
   }
   GlmDsaLayerStream::set_resident_image_dir(saved);
   fs::remove_all(cache);
+  }
 }
 
 DGPP_TEST(glm_dsa_loader_refuses_a_shape_record_that_disagrees) {
@@ -406,6 +425,43 @@ DGPP_TEST(glm_dsa_loader_refuses_a_shape_record_that_disagrees) {
   }
   require(refused, "a shape record off the packed geometry is refused by name");
   (void)s.load_layer(1);  // an untouched layer still loads
+}
+
+// The codebook triple's host decode: every element of a resident NF4I8
+// expert slice is codebook[index] x bf16(scale) with the index the low
+// nibble first and one scale per 128 columns — the exact value the
+// kernels compute (quant_matrix.hpp), read back through packq_decode.
+DGPP_TEST(glm_dsa_loader_nf4i8_experts_decode_through_the_codebook) {
+  const Fixture fx = write_fixture(true);
+  GlmDsaLayerStream s(fx.cfg, fx.dir, 1, 2);
+  const auto& r = s.load_layer(2);
+  const dgpp::GlmPackedMatrix& m = r.moe_w.expert(3, 2);  // the down projection: a column slice
+  require(m.scale_fmt == dgpp::kPackedScaleBf16G128Nf4i8 && m.bits == 4 && m.cols == 256 && m.rows == 256,
+          "a world-2 down slice: [hidden, inter/2] in the codebook format");
+  const std::vector<uint8_t> words = device_bytes(m.packed, static_cast<size_t>(m.rows * m.cols / 2));
+  const std::vector<uint8_t> scales = device_bytes(m.scales, static_cast<size_t>(m.rows * m.cols / 128 * 2));
+  const uint32_t* w = reinterpret_cast<const uint32_t*>(words.data());
+  const uint16_t* sc = reinterpret_cast<const uint16_t*>(scales.data());
+  // Against the checkpoint's own bytes (columns [256, 512) of expert 3's down).
+  const std::string base = "model.layers.2.mlp.experts.3.down_proj";
+  const std::vector<uint8_t> src_w = fx.bytes(base + ".weight_indices");
+  const std::vector<uint8_t> src_s = fx.bytes(base + ".weight_scale");
+  const uint32_t* sw = reinterpret_cast<const uint32_t*>(src_w.data());
+  const uint16_t* ss = reinterpret_cast<const uint16_t*>(src_s.data());
+  int levels_seen[16] = {};
+  for (int64_t row = 0; row < m.rows; ++row)
+    for (int64_t c = 0; c < m.cols; ++c) {
+      const uint32_t word = w[row * (m.cols / 8) + c / 8];
+      const unsigned idx = (word >> (4 * (c % 8))) & 15u;
+      ++levels_seen[idx];
+      const float want = static_cast<float>(dgpp::kNf4i8Codebook[idx]) *
+                         dgpp::bf16_bits_to_float(sc[row * (m.cols / 128) + c / 128]);
+      const float got = dgpp::packq_decode(w, sc, m.cols, 4, row, c, dgpp::kPackedScaleBf16G128Nf4i8);
+      require(got == want, "codebook decode");
+      const float checkpoint = dgpp::packq_decode(sw, ss, 512, 4, row, 256 + c, dgpp::kPackedScaleBf16G128Nf4i8);
+      require(got == checkpoint, "the slice decodes to the checkpoint's columns");
+    }
+  for (int l = 0; l < 16; ++l) require(levels_seen[l] > 0, "every codebook level occurs in the random fixture");
 }
 
 int main() { return dgpp::test::run_all(); }

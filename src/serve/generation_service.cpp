@@ -108,6 +108,36 @@ const char* finish_reason(Scheduler::Result::Reason r, bool tool_calls) {
   }
 }
 
+// Response-only compatibility metrics. Existing usage, scheduler meters,
+// Prometheus histograms and throughput logs retain their own definitions.
+// llama.cpp server_slot_stats (9c2e0e491a82): prompt rates count uncached
+// tokens; decode rates exclude the first token supplied by each prefill.
+void append_timings(std::string* out, int prompt_tokens, int cached_tokens,
+                    int completion_tokens, int prefill_tokens, double prompt_ms,
+                    double predicted_ms) {
+  const int computed_tokens = std::max(0, prompt_tokens - cached_tokens);
+  const int decode_tokens = std::max(0, completion_tokens - prefill_tokens);
+  out->append(",\"timings\":{\"prompt_n\":");
+  append_json_int(out, computed_tokens);
+  out->append(",\"cache_n\":");
+  append_json_int(out, cached_tokens);
+  out->append(",\"predicted_n\":");
+  append_json_int(out, completion_tokens);
+  out->append(",\"prompt_ms\":");
+  append_json_float(out, prompt_ms);
+  out->append(",\"prompt_per_token_ms\":");
+  append_json_float(out, computed_tokens > 0 ? prompt_ms / computed_tokens : 0);
+  out->append(",\"prompt_per_second\":");
+  append_json_float(out, prompt_ms > 0 ? computed_tokens / prompt_ms * 1000 : 0);
+  out->append(",\"predicted_ms\":");
+  append_json_float(out, predicted_ms);
+  out->append(",\"predicted_per_token_ms\":");
+  append_json_float(out, decode_tokens > 0 ? predicted_ms / decode_tokens : 0);
+  out->append(",\"predicted_per_second\":");
+  append_json_float(out, predicted_ms > 0 ? decode_tokens / predicted_ms * 1000 : 0);
+  out->push_back('}');
+}
+
 // The usage object, with the details OpenAI reports:
 // prompt_tokens_details.cached_tokens — the prompt tokens the prefix cache
 // served (the attach position) — and completion_tokens_details.
@@ -3041,10 +3071,10 @@ void GenerationService::on_token(const std::string& id, int64_t token,
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& r : records_) {
       if (r->sched_id != id || r->done) continue;
+      const auto now = std::chrono::steady_clock::now();
       if (steps_done == 1) {
         // The first token: the time to first token, split by whether the
         // prefix cache served the prompt's head (M7).
-        const auto now = std::chrono::steady_clock::now();
         const double ms = std::chrono::duration<double, std::milli>(now - r->arrived).count();
         if (r->prefix_hit) {
           stats_.ttft_hit_count++;
@@ -3062,6 +3092,17 @@ void GenerationService::on_token(const std::string& id, int64_t token,
         if (r->admit_seen)
           stats_.prefill_s.observe(std::chrono::duration<double>(now - r->admitted_at).count());
       }
+      // Separate response timing state; the measurements above keep their
+      // existing definitions, including queue time in TTFT.
+      if (steps_done == 1) {
+        ++r->group->prefill_tokens;
+        if (r->choice == 0 && r->admit_seen)
+          r->group->prompt_ms =
+              std::chrono::duration<double, std::milli>(now - r->admitted_at).count();
+      }
+      if (r->group->first_token == std::chrono::steady_clock::time_point{})
+        r->group->first_token = now;
+      r->group->last_token = now;
       r->ids.push_back(token);
       if (r->logprobs >= 0) r->content_lps.push_back(false);
       if (r->chat) {
@@ -3528,6 +3569,28 @@ void GenerationService::pump_records() {
       flush_legacy_stream(*r);
   }
 
+  // Append once all choices have retired. Prompt accounting follows
+  // choice 0, as usage does; decode throughput spans the group's tokens.
+  auto append_group_timings = [this](const StreamRecord& r, std::string* out) {
+    double prompt_ms = 0, predicted_ms = 0;
+    int prefill_tokens = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      const ChoiceGroup& g = *r.group;
+      prompt_ms = g.prompt_ms;
+      prefill_tokens = g.prefill_tokens;
+      if (prefill_tokens > 0) {
+        // Match llama.cpp's one-microsecond minimum for a generated token.
+        predicted_ms = std::max(0.001, std::chrono::duration<double, std::milli>(
+                                          g.last_token - g.first_token).count());
+      }
+    }
+    out->pop_back();
+    append_timings(out, r.prompt_tokens, r.group->cached_tokens,
+                   r.group->completion_tokens, prefill_tokens, prompt_ms, predicted_ms);
+    out->push_back('}');
+  };
+
   for (auto& r : finished) {
     if (r->writer != nullptr && !r->writer_dead) {
       ChoiceGroup& g = *r->group;
@@ -3618,16 +3681,21 @@ void GenerationService::pump_records() {
           }
         }
         const char* finish = finish_reason(r->reason, !r->calls.empty());
-        write_stream_event(*r,
+        std::string terminal =
             r->chat ? chat_chunk_final(r->id, r->created_unix, r->model,
                                        finish, lp_json, r->choice)
                     : text_chunk_final(r->id, r->created_unix, r->model,
-                                       finish, lp_json));
+                                       finish, lp_json);
+        const bool last_choice = g.finished + 1 == g.n && !g.ended;
+        if (last_choice && !r->include_usage) append_group_timings(*r, &terminal);
+        write_stream_event(*r, std::move(terminal));
         if (++g.finished == g.n && !g.ended) {
           if (r->include_usage) {
-            write_stream_event(*r, chat_chunk_usage(
+            std::string usage = chat_chunk_usage(
                 r->id, r->created_unix, r->model, r->prompt_tokens,
-                g.completion_tokens, g.cached_tokens, g.reasoning_tokens), true);
+                g.completion_tokens, g.cached_tokens, g.reasoning_tokens);
+            append_group_timings(*r, &usage);
+            write_stream_event(*r, std::move(usage), true);
           }
           r->writer->write_event("[DONE]");
           r->writer->end_stream();
@@ -3699,6 +3767,7 @@ void GenerationService::pump_records() {
                                              joined, r->prompt_tokens,
                                              g.completion_tokens,
                                              g.cached_tokens);
+          append_group_timings(*r, &response);
           response.pop_back();
           if (r->report_service_tier) response.append(",\"service_tier\":\"default\"");
           if (!r->metadata.empty()) response.append(",\"metadata\":" + r->metadata);

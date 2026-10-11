@@ -265,10 +265,17 @@ def gemm_row(x, w, n_out, n_in):
             for o in range(n_out)]
 
 
-def expert_mlp(x, wg, wu, wd, hidden, inter, limit):
-    g = gemm_row(x, wg, inter, hidden)
-    u = gemm_row(x, wu, inter, hidden)
+def expert_mlp(x, wg, wu, wd, hidden, inter, limit, rotate=None):
+    """`rotate` (the NF4I8 contract, src/models/glm/moe.hpp
+    kMoeInputHadamard32): a row -> row transform applied to every
+    projection's input — the expert input before gate / up, the SwiGLU
+    output before down — as the engine rotates them."""
+    xin = rotate(x) if rotate else x
+    g = gemm_row(xin, wg, inter, hidden)
+    u = gemm_row(xin, wu, inter, hidden)
     act = [swiglu(g[i], u[i], limit) for i in range(inter)]
+    if rotate:
+        act = rotate(act)
     return gemm_row(act, wd, hidden, inter)
 
 
@@ -278,11 +285,13 @@ def dense_mlp_rows(x_rows, dense, hidden, inter, limit):
 
 
 def moe_reference(x_rows, moe, hidden, inter, top_k, n_experts, limit,
-                  norm_topk, scaling):
+                  norm_topk, scaling, rotate=None):
     """Mirror of glm_moe_ref_router + glm_moe_ref_forward: biased selection,
     uncorrected weights, per-element normalization, ascending-id
     accumulation, shared expert last. Also returns every token's full
-    biased-score row (the near-tie certification inputs)."""
+    biased-score row (the near-tie certification inputs). `rotate`: the
+    routed experts' input transform (expert_mlp); the shared expert and
+    the router read the plain rows."""
     gate, bias, experts, shared = moe
     out_rows, ids_all, weights_all, biased_all = [], [], [], []
     for x in x_rows:
@@ -311,8 +320,11 @@ def moe_reference(x_rows, moe, hidden, inter, top_k, n_experts, limit,
         out = [0.0] * hidden
         for idx in range(top_k):
             e = ids[idx]
+            # `rotate` per expert (a list: the Mixed346 contract's converted
+            # and existing experts) or one transform for every expert.
+            rot = rotate[e] if isinstance(rotate, list) else rotate
             y = expert_mlp(x, experts[e * 3], experts[e * 3 + 1],
-                           experts[e * 3 + 2], hidden, inter, limit)
+                           experts[e * 3 + 2], hidden, inter, limit, rot)
             we = weights[idx]
             for d in range(hidden):
                 contrib = bf16_round(we * y[d])

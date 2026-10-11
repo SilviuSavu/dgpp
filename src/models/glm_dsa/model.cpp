@@ -14,6 +14,7 @@
 #include "kernels/bf12_companions.hpp"
 #include "kernels/dsa.hpp"
 #include "kernels/glm_norm.hpp"
+#include "kernels/scale_gemm.hpp"
 #include "kernels/kernels.hpp"
 
 namespace dgpp {
@@ -606,7 +607,7 @@ DsaLayerWeights GlmDsaModel::dsa_view(const GlmDsaAttnResident& a) const {
   return w;
 }
 
-GlmMoeWeights GlmDsaModel::moe_view(const GlmDsaMoeResident& m) {
+GlmMoeWeights GlmDsaModel::moe_view(const GlmDsaMoeResident& m, bool hadamard32, bool int8_activations) {
   GlmMoeWeights w;
   w.router_gate = m.router;
   w.router_bias = m.router_bias;
@@ -614,6 +615,10 @@ GlmMoeWeights GlmDsaModel::moe_view(const GlmDsaMoeResident& m) {
   w.experts = nullptr;
   w.experts_fp4 = nullptr;
   w.experts_packed = m.experts.data();
+  // The routed experts' input form: plain, H32-rotated (NF4I8), or
+  // H32-rotated int8 codes (Mixed346; the layer's existing experts read
+  // the plain rows by their view's format).
+  w.routed_input_transform = int8_activations ? kMoeInputHadamard32Int8 : hadamard32 ? kMoeInputHadamard32 : kMoeInputPlain;
   return w;
 }
 
@@ -626,10 +631,11 @@ void GlmDsaModel::build_layer_objects(const GlmDsaLayerResident& r) {
     dsa_->rebind(dsa_view(r.attn));
   }
   if (r.moe) {
+    const GlmMoeWeights w = moe_view(r.moe_w, cfg_.expert_input_hadamard32_of(r.layer), cfg_.expert_activation_bits_of(r.layer) == 8);
     if (!moe_) {
-      moe_ = std::make_unique<GlmMoeLayer>(moe_view(r.moe_w), moe_cfg_, max_tokens_, max_decode_rows_, table_slots());
+      moe_ = std::make_unique<GlmMoeLayer>(w, moe_cfg_, max_tokens_, max_decode_rows_, table_slots());
     } else {
-      moe_->rebind(moe_view(r.moe_w));
+      moe_->rebind(w);
     }
   }
 }
@@ -805,7 +811,16 @@ void GlmDsaModel::enqueue_layer(const GlmDsaLayerResident& r, int pool_layer, ui
   fold(attn_out, T, H, rows.capture);  // block boundary 1: o_proj's partial
   glm_residual_add_bf16(resid, attn_out, n, stream_);
   // ---- the MLP / MoE block ----------------------------------------------------
-  glm_rmsnorm_bf16(resid, r.post_norm, x_, T, H, eps, stream_);
+  if (r.moe && moe_->hidden_codes()) {
+    // The Mixed346 layer's expert-input codes from the norm's own pass
+    // (one kernel instead of the norm and the quantizer; the MoE layer's
+    // decode and tensor-core prefill chains read them as given).
+    glm_rmsnorm_bf16_quant_int8(resid, r.post_norm, x_, moe_->hidden_codes(), static_cast<size_t>(H),
+                                moe_->hidden_code_scales(), static_cast<size_t>(H / 128), T, H, eps, stream_);
+    moe_->mark_hidden_codes_ready(true);
+  } else {
+    glm_rmsnorm_bf16(resid, r.post_norm, x_, T, H, eps, stream_);
+  }
   uint16_t* ffn_out = stage(y_, T, H, rows.capture);
   if (r.moe) {
     if (rows.decode)
@@ -850,7 +865,8 @@ GlmDsaModel::Outputs GlmDsaModel::run_rows(const RowRun& run) {
   // DGPP_GLM_DSA_CAPTURE_DECODE=1: an eager decode walk keeps every layer's
   // rows too (the decode-vs-prefill localizer in glm_dsa_decode_test).
   static const bool capture_decode_env = std::getenv("DGPP_GLM_DSA_CAPTURE_DECODE") != nullptr;
-  const bool capture_layers = run.capture_layers || (run.decode && !run.capture && capture_decode_env);
+  const bool capture_layers = run.capture_layers || (session_capture_layers_ && !run.capture) ||
+                              (run.decode && !run.capture && capture_decode_env);
   for (int layer = 0; layer < cfg_.num_hidden_layers; ++layer) {
     const GlmDsaLayerResident& r = loader_.load_layer(layer);
     MoeTraceStaging trace;
@@ -1034,8 +1050,21 @@ void GlmDsaModel::mtp_run_rows(int req, const int64_t* tokens, int64_t first_pos
   // ---- head: the draft distribution over the last head_rows rows --------
   const uint16_t* head_in = mtp_r_ + static_cast<size_t>(T - head_rows) * H;
   glm_rmsnorm_bf16(head_in, r.shared_head_norm, h_, head_rows, H, eps, stream_);
-  gemm_.matmul(h_, globals_.lm_head, logits_, head_rows, lm_vocab_count_, H, DType::BF16, GemmOut::F32,
-               static_cast<size_t>(H), gemm_ws_, gemm_ws_bytes_, stream_);
+  if (globals_.lm_head_fp8.payload) {
+    // engine.mtp_head = fp8: the draft's distribution from the head's
+    // block-FP8 copy (the fp8 scale-GEMM core, f32 logits as below); the
+    // verifier's head (run_rows) is untouched.
+    static const bool logged = [&] {
+      DGPP_LOG_INFO("glm_dsa: the draft head reads the block-FP8 copy ({} rows a call here)", head_rows);
+      return true;
+    }();
+    (void)logged;
+    launch_scale_gemm_f32(h_, static_cast<size_t>(H), globals_.lm_head_fp8.payload, globals_.lm_head_fp8.scales,
+                          logits_, head_rows, lm_vocab_count_, H, stream_);
+  } else {
+    gemm_.matmul(h_, globals_.lm_head, logits_, head_rows, lm_vocab_count_, H, DType::BF16, GemmOut::F32,
+                 static_cast<size_t>(H), gemm_ws_, gemm_ws_bytes_, stream_);
+  }
   if (decode_row) prefetch_.join(stream_);
   if (decode_row && (!capture || decode_tail_mirrors_) && head_rows <= max_decode_rows_)
     DGPP_CUDA_OK(cudaMemcpyAsync(h_tail_logits_, logits_, static_cast<size_t>(head_rows) * lm_vocab_count_ * sizeof(float),

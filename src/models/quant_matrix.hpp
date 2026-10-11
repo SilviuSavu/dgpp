@@ -144,13 +144,72 @@ inline GlmFp4Matrix fp4_rows_view(const GlmFp4Matrix& m, int64_t row_start,
 //     AutoRound int4 g128 and int8 g128 (the Qwen3.8 AutoRound hybrid): the
 //     checkpoint's own scales, untouched, widened to fp32 exactly in the
 //     kernels; the value is (code - 2^(bits-1)) * float(scales[n][k/128]).
+//   kPackedScaleBf16G128Nf4i8 (2, 2026-10-08): the NF4I8 codebook format
+//     (HawkBearPig/GLM-5.3-NF4I8-GPTQ-H32-g128, its FORMAT.md): 4-bit
+//     codes are INDICES into the fixed 16-level int8 codebook
+//     kNf4i8Codebook (round(127 x NF4)), packed as the int4 form above
+//     (`weight_indices` I32 [N, K/8], the low nibble first), one bf16
+//     scale per 128 codes; the value is kNf4i8Codebook[code] *
+//     float(scales[n][k/128]), exact in fp32 (an 8-bit integer times a
+//     bf16). 4-bit only. The checkpoint rotated the routed experts' inputs
+//     by a 32-wide Hadamard before quantizing (the layer's
+//     routed_input_transform, models/glm/moe.hpp), which is not a matrix
+//     property: the matrix is a plain [N, K] weight in the rotated basis.
+//   kPackedScaleBf16G128Mixed346 (3, 2026-10-09): the Mixed346 format
+//     (HawkBearPig/GLM-5.3-Mixed346-GPTQ-H32-A8-g128, its FORMAT.md): a
+//     matrix's codes are 3, 4 or 6 bits wide (`bits`), one dense bit
+//     stream per row (`weight_indices` I32 [N, K*bits/32]: code k at bit
+//     k*bits, the low bits first, codes crossing word boundaries — the
+//     4-bit stream is the nibble form above), one bf16 scale per 128
+//     codes; the level is the width's codebook entry — kGauss3Codebook
+//     at 3 bits, kNf4i8Codebook at 4, code - 32 at 6 — times the scale,
+//     exact in fp32. The activations those matrices multiply are the
+//     checkpoint's INT8 codes (H32-rotated rows, one fp32 scale per 128
+//     values: kMoeInputHadamard32Int8, models/glm/moe.hpp), a layer
+//     property; a layer mixes such triples with baseline (format 0, int4
+//     g64, bf16 activations) triples expert by expert.
 constexpr int kPackedGroup = 64;  // elements per bf16 group scale (format 0)
 constexpr int kPackedScaleBf16G64 = 0;
 constexpr int kPackedScaleF16G128 = 1;
-inline int packed_scale_group(int scale_fmt) { return scale_fmt == kPackedScaleF16G128 ? 128 : 64; }
+constexpr int kPackedScaleBf16G128Nf4i8 = 2;
+constexpr int kPackedScaleBf16G128Mixed346 = 3;
+constexpr int kNf4i8Codebook[16] = {-127, -88, -67, -50, -36, -23, -12, 0,
+                                    10,   20,  31,  43,  56,  71,  92,  127};
+// The Mixed346 format's 3-bit levels (Gaussian Lloyd-Max, the recipe's).
+constexpr int kGauss3Codebook[8] = {-127, -79, -45, -14, 14, 45, 79, 127};
+inline bool packed_scale_fmt_known(int scale_fmt) {
+  return scale_fmt == kPackedScaleBf16G64 || scale_fmt == kPackedScaleF16G128 ||
+         scale_fmt == kPackedScaleBf16G128Nf4i8 || scale_fmt == kPackedScaleBf16G128Mixed346;
+}
+inline int packed_scale_group(int scale_fmt) { return scale_fmt == kPackedScaleBf16G64 ? 64 : 128; }
+// Whether the codes are codebook indices under `weight_indices` (formats
+// 2 and 3) rather than offset integers under `weight_packed`.
+inline bool packed_codebook(int scale_fmt) {
+  return scale_fmt == kPackedScaleBf16G128Nf4i8 || scale_fmt == kPackedScaleBf16G128Mixed346;
+}
+inline bool packed_mixed346(int scale_fmt) { return scale_fmt == kPackedScaleBf16G128Mixed346; }
+// The code widths a scale format stores: 4 or 8 offset codes, the NF4I8
+// codebook's 4-bit indices, the Mixed346 format's 3-, 4- or 6-bit ones.
+inline bool packed_bits_allowed(int scale_fmt, int bits) {
+  if (scale_fmt == kPackedScaleBf16G128Mixed346) return bits == 3 || bits == 4 || bits == 6;
+  if (scale_fmt == kPackedScaleBf16G128Nf4i8) return bits == 4;
+  return bits == 4 || bits == 8;
+}
 // The host widening of one stored scale (the kernels' exactly).
 inline float packed_scale_to_float(uint16_t bits, int scale_fmt) {
   return scale_fmt == kPackedScaleF16G128 ? fp16_bits_to_float(bits) : bf16_bits_to_float(bits);
+}
+// The integer level of one unsigned stored code (the kernels' exactly):
+// the width's codebook entry under formats 2 and 3, code - 2^(bits-1)
+// otherwise.
+inline int packed_code_level(unsigned code, int bits, int scale_fmt) {
+  if (scale_fmt == kPackedScaleBf16G128Mixed346) {
+    if (bits == 3) return kGauss3Codebook[code & 7u];
+    if (bits == 4) return kNf4i8Codebook[code & 15u];
+    return static_cast<int>(code & 63u) - 32;
+  }
+  if (packed_codebook(scale_fmt)) return kNf4i8Codebook[code & 15u];
+  return static_cast<int>(code) - (1 << (bits - 1));
 }
 
 // The payload layout: rows of codes in k order (every packed matrix), or
@@ -161,10 +220,10 @@ constexpr int kPackedLayoutPlanes8 = 1;
 
 struct GlmPackedMatrix {
   const uint32_t* packed = nullptr;       // I32 [rows, cols*bits/32]
-  const uint16_t* scales = nullptr;       // bf16 [rows, cols/64] (format 0) or f16 [rows, cols/128] (format 1)
+  const uint16_t* scales = nullptr;       // bf16 [rows, cols/64] (format 0), f16 [rows, cols/128] (format 1), bf16 [rows, cols/128] (format 2)
   int64_t rows = 0;
   int64_t cols = 0;                       // logical K (elements)
-  int bits = 0;                           // 4 or 8
+  int bits = 0;                           // 4 or 8 (3 / 4 / 6 under format 3)
   int scale_fmt = kPackedScaleBf16G64;    // kPackedScale*
   int layout = kPackedLayoutRows;         // kPackedLayout*
 
@@ -184,10 +243,11 @@ struct GlmPackedMatrix {
 // groups. Row slices are free: every row carries its own scales.
 inline void packed_check_cols(int64_t cols, int bits, const char* who,
                               int scale_fmt = kPackedScaleBf16G64) {
-  if (bits != 4 && bits != 8)
-    throw std::invalid_argument(std::string(who) + ": the packed code width must be 4 or 8");
-  if (scale_fmt != kPackedScaleBf16G64 && scale_fmt != kPackedScaleF16G128)
+  if (!packed_scale_fmt_known(scale_fmt))
     throw std::invalid_argument(std::string(who) + ": unknown packed scale format");
+  if (!packed_bits_allowed(scale_fmt, bits))
+    throw std::invalid_argument(std::string(who) + ": the packed code width " + std::to_string(bits) +
+                                " is not the scale format's (4 or 8; the NF4I8 codebook 4; Mixed346 3, 4 or 6)");
   const int g = packed_scale_group(scale_fmt);
   if (cols <= 0 || cols % g != 0)
     throw std::invalid_argument(std::string(who) + ": packed K must be a positive multiple of " +

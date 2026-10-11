@@ -32,6 +32,7 @@
 #include "kernels/fp4_gemv.hpp"
 #include "kernels/glm_moe_launch.hpp"
 #include "kernels/latent_format.hpp"
+#include "kernels/hadamard32.hpp"
 #include "kernels/packq_gemv.hpp"
 #include "kernels/scale_gemm.hpp"
 #include "models/glm/moe.hpp"
@@ -231,6 +232,7 @@ struct SmallCase {
       dev_w.router_bias = d_bias;
       dev_w.experts = nullptr;
       dev_w.experts_packed = expert_mats_packq.data();
+      dev_w.routed_input_transform = host_w.routed_input_transform;
       for (int m = 0; m < 3; ++m) dev_w.shared_packed[m] = expert_mats_packq[static_cast<size_t>(E) * 3 + m];
       DGPP_CUDA_OK(cudaMallocManaged(&d_out, static_cast<size_t>(tokens) * cfg.hidden * 2));
       return;
@@ -338,9 +340,28 @@ void pack_codes_into(const std::vector<int>& codes, int bits, std::vector<uint32
   }
 }
 
+// The Mixed346 forms (2026-10-09): `m346_forms` (E entries of "gud" digits
+// in {3, 4, 6} with g == u, or "existing") makes the case a Mixed346 layer —
+// every routed matrix at its own width and format (3 / 4 / 6 under format
+// 3 as a dense index stream, or int4 g64 for an existing expert), the
+// shared triple int8, the int8 activation transform.
+void pack_dense_into(const std::vector<unsigned>& idx, int bits, std::vector<uint32_t>& out) {
+  const size_t base = out.size();
+  out.resize(base + idx.size() * static_cast<size_t>(bits) / 32, 0u);
+  for (size_t i = 0; i < idx.size(); ++i) {
+    const size_t pos = i * static_cast<size_t>(bits);
+    const size_t w = base + pos / 32;
+    const int shift = static_cast<int>(pos % 32);
+    out[w] |= idx[i] << shift;
+    if (shift + bits > 32) out[w + 1] |= idx[i] >> (32 - shift);
+  }
+}
+const char* const kM346Forms[8] = {"444", "334", "446", "333", "666", "443", "336", "existing"};
+
 SmallCase make_small_case(int E, int H, int I, int K, int tokens,
                           uint64_t seed, bool nvfp4 = false, bool shared_nvfp4 = false,
-                          int packq_bits = 0, int fp4_group = 16, int packq_scale_fmt = 0) {
+                          int packq_bits = 0, int fp4_group = 16, int packq_scale_fmt = 0,
+                          int routed_input_transform = 0, const char* const* m346_forms = nullptr) {
   SmallCase c;
   c.cfg.hidden = H;
   c.cfg.inter = I;
@@ -374,11 +395,56 @@ SmallCase make_small_case(int E, int H, int I, int K, int tokens,
   c.host_w.packq_bits_routed = packq_bits != 0 ? packq_bits : 4;
   c.host_w.packq_bits_shared = 8;
   // The routed matrices' scale format (0: bf16 per 64; 1: f16 per 128, the
-  // AutoRound hybrid); the shared triple stays bf16 per 64.
+  // AutoRound hybrid; 2: the NF4I8 codebook, bf16 per 128 — the nibbles
+  // are then indices, every one valid); the shared triple stays bf16 per
+  // 64. The routed input transform (kMoeInputHadamard32 with format 2):
+  // the oracle and the engine rotate the routed experts' inputs alike.
   c.host_w.packq_scale_fmt = packq_scale_fmt;
+  c.host_w.routed_input_transform = routed_input_transform;
+  if (m346_forms != nullptr) {
+    c.host_w.packq = true;
+    c.host_w.shared_packq = true;
+    c.host_w.packq_bits_routed = 4;
+    c.host_w.packq_scale_fmt = dgpp::kPackedScaleBf16G128Mixed346;
+    c.host_w.routed_input_transform = dgpp::kMoeInputHadamard32Int8;
+    c.cfg.routed_int8_activations = true;
+    c.host_w.packq_matrix_bits.assign(static_cast<size_t>(E) * 3, 4);
+    c.host_w.packq_matrix_fmt.assign(static_cast<size_t>(E) * 3, 0);
+    for (int e = 0; e < E; ++e) {
+      const std::string f = m346_forms[e];
+      if (f == "existing") continue;
+      for (int m = 0; m < 3; ++m) {
+        c.host_w.packq_matrix_bits[static_cast<size_t>(e) * 3 + m] = static_cast<uint8_t>(f[m] - '0');
+        c.host_w.packq_matrix_fmt[static_cast<size_t>(e) * 3 + m] = dgpp::kPackedScaleBf16G128Mixed346;
+      }
+    }
+  }
   for (int m = 0; m < (E + 1) * 3; ++m) {
     const bool down = m % 3 == 2;
     const int64_t rows = down ? H : I, cols = down ? I : H;
+    if (m346_forms != nullptr) {
+      const int bits = c.host_w.packq_bits_of(m, E);
+      const int sf = c.host_w.packq_fmt_of(m, E);
+      if (sf == dgpp::kPackedScaleBf16G128Mixed346) {
+        std::vector<unsigned> idx(static_cast<size_t>(rows) * cols);
+        for (auto& u : idx) u = static_cast<unsigned>(rng.next() % (1u << bits));
+        pack_dense_into(idx, bits, c.host_w.packq_words);
+      } else {
+        const int lo = -(1 << (bits - 1)), hi = (1 << (bits - 1)) - 1;
+        std::vector<int> codes(static_cast<size_t>(rows) * cols);
+        for (auto& cd : codes) cd = lo + static_cast<int>(rng.next() % static_cast<uint64_t>(hi - lo + 1));
+        pack_codes_into(codes, bits, c.host_w.packq_words);
+      }
+      const size_t sn = static_cast<size_t>(rows) * cols / dgpp::packed_scale_group(sf);
+      for (size_t i = 0; i < sn; ++i) {
+        // Release-like magnitudes: levels reach 127 at 3 / 4 bits (format
+        // 3), 31 at 6, 7 for the int4 offset codes, 127 for int8.
+        const float base = sf == dgpp::kPackedScaleBf16G128Mixed346 ? (bits == 6 ? 0.001f : 0.00025f)
+                           : bits == 4 ? 0.004f : 0.0003f;
+        c.host_w.packq_scales.push_back(float_to_bf16_bits(static_cast<float>(std::exp2(rng.unit() * 2.0)) * base));
+      }
+      continue;
+    }
     if (packq_bits != 0) {
       const bool routed = m < E * 3;
       const int bits = routed ? packq_bits : 8;
@@ -389,8 +455,11 @@ SmallCase make_small_case(int E, int H, int I, int K, int tokens,
       pack_codes_into(codes, bits, c.host_w.packq_words);
       const size_t sn = static_cast<size_t>(rows) * cols / dgpp::packed_scale_group(sf);
       for (size_t i = 0; i < sn; ++i) {
-        const float v = static_cast<float>(std::exp2(rng.unit() * 2.0)) * (bits == 4 ? 0.004f : 0.0003f);
-        c.host_w.packq_scales.push_back(sf == 0 ? float_to_bf16_bits(v) : dgpp::float_to_fp16_bits(v));
+        // Release-like magnitudes; the codebook's levels reach 127 (not 7),
+        // so its scales sit 16x lower for the same weights.
+        const float v = static_cast<float>(std::exp2(rng.unit() * 2.0)) *
+                        (bits == 4 ? (dgpp::packed_codebook(sf) ? 0.00025f : 0.004f) : 0.0003f);
+        c.host_w.packq_scales.push_back(sf == 1 ? dgpp::float_to_fp16_bits(v) : float_to_bf16_bits(v));
       }
       continue;
     }
@@ -532,16 +601,17 @@ struct RankSlice {
           r.mats_packq[static_cast<size_t>(m)] = dgpp::packed_rows_view(full, rank * M, M);
           continue;
         }
-        const int per = 32 / full.bits;
+        // Words per row and per slice: cols x bits / 32 (a dense stream at 3
+        // or 6 bits is whole words at a 128-multiple slice, as the loader's).
+        const int64_t wpr = I * full.bits / 32, wps = M * full.bits / 32;
         const int g = full.group();
         require(M % g == 0, "packq slice test geometry: inter/world must be a multiple of the scale group");
         uint32_t* packed = nullptr;
         uint16_t* scales = nullptr;
-        DGPP_CUDA_OK(cudaMallocManaged(&packed, static_cast<size_t>(H) * (M / per) * 4));
+        DGPP_CUDA_OK(cudaMallocManaged(&packed, static_cast<size_t>(H) * wps * 4));
         DGPP_CUDA_OK(cudaMallocManaged(&scales, static_cast<size_t>(H) * (M / g) * 2));
         for (int64_t row = 0; row < H; ++row) {
-          std::memcpy(packed + row * (M / per), full.packed + row * (I / per) + rank * M / per,
-                      static_cast<size_t>(M / per) * 4);
+          std::memcpy(packed + row * wps, full.packed + row * wpr + rank * wps, static_cast<size_t>(wps) * 4);
           std::memcpy(scales + row * (M / g), full.scales + row * (I / g) + rank * M / g,
                       static_cast<size_t>(M / g) * 2);
         }
@@ -554,6 +624,7 @@ struct RankSlice {
       r.dev_w.router_bias = c.dev_w.router_bias;
       r.dev_w.experts = nullptr;
       r.dev_w.experts_packed = r.mats_packq.data();
+      r.dev_w.routed_input_transform = c.dev_w.routed_input_transform;
       for (int m = 0; m < 3; ++m) r.dev_w.shared_packed[m] = r.mats_packq[static_cast<size_t>(E) * 3 + m];
       DGPP_CUDA_OK(cudaMallocManaged(&r.d_out, static_cast<size_t>(c.tokens) * H * 2));
       return r;
@@ -2369,15 +2440,17 @@ DGPP_TEST(moe_expert_path_matches_oracle_small_geometry_packq) {
   // chain against the double oracle, within the expert-path budget and
   // bitwise repeatable; at both routed scale formats (sf 1: f16 per 128,
   // the AutoRound hybrid, the shared triple still bf16 per 64).
-  for (int sf : {0, 1})
+  for (int sf : {0, 1, 2})
   for (int bits : {4, 8})
     for (auto [E, H, I, K, M] :
          std::vector<std::tuple<int, int, int, int, int>>{
              {8, 512, 256, 2, 1}, {8, 512, 256, 2, 6}, {16, 1024, 512, 4, 5}}) {
+      if (sf == 2 && bits != 4) continue;  // the codebook format is 4-bit
+      const int rit = sf == 2 ? dgpp::kMoeInputHadamard32 : dgpp::kMoeInputPlain;
       SmallCase c = make_small_case(E, H, I, K, M, 0x9AC0FFEE + E + M + bits + 77 * sf, false,
-                                    false, bits, 16, sf);
+                                    false, bits, 16, sf, rit);
       c.alloc();
-      run_small_case(c, ("packq int" + std::to_string(bits) + (sf ? " g128/f16" : "") +
+      run_small_case(c, ("packq int" + std::to_string(bits) + (sf == 1 ? " g128/f16" : sf == 2 ? " nf4i8+h32" : "") +
                          " expert path E=" + std::to_string(E) + " M=" + std::to_string(M)).c_str(),
                      dgpp::MoeExpertKernel::kGemv);
       c.free_all();
@@ -2385,14 +2458,18 @@ DGPP_TEST(moe_expert_path_matches_oracle_small_geometry_packq) {
 }
 
 DGPP_TEST(moe_packq_prefill_tile_matches_oracle_and_host_segmentation) {
-  for (int sf : {0, 1})
+  for (int sf : {0, 1, 2})
   for (int bits : {4, 8})
     for (int tokens : {16, 17, 33, 127, 128, 129, 257}) {
+      if (sf == 2 && bits != 4) continue;
+      const int rit = sf == 2 ? dgpp::kMoeInputHadamard32 : dgpp::kMoeInputPlain;
       SmallCase c = make_small_case(8, 512, 256, 2, tokens, 0x61A0 + tokens + bits + 77 * sf,
-                                    false, false, bits, 16, sf);
+                                    false, false, bits, 16, sf, rit);
       c.alloc();
       const auto kernel = tokens < 128 ? dgpp::MoeExpertKernel::kGemv : dgpp::MoeExpertKernel::kMma;
-      run_small_case(c, sf ? "packed g128/f16 expert prefill lowering" : "packed expert prefill lowering",
+      run_small_case(c, sf == 1 ? "packed g128/f16 expert prefill lowering"
+                        : sf == 2 ? "packed nf4i8+h32 expert prefill lowering"
+                                  : "packed expert prefill lowering",
                      kernel);
       std::vector<uint16_t> host(static_cast<size_t>(tokens) * c.cfg.hidden);
       std::memcpy(host.data(), c.d_out, host.size() * 2);
@@ -2414,11 +2491,13 @@ DGPP_TEST(moe_decode_slot_path_is_bitwise_host_path_packq) {
       {8, 512, 256, 2, 3},    // multi-row steps
       {16, 1024, 512, 4, 2},  // gate k=1024, down k=512, K=4
   };
-  for (int sf : {0, 1})
+  for (int sf : {0, 1, 2})
   for (int bits : {4, 8})
     for (const Case& cs : cases) {
+      if (sf == 2 && bits != 4) continue;
+      const int rit = sf == 2 ? dgpp::kMoeInputHadamard32 : dgpp::kMoeInputPlain;
       SmallCase c = make_small_case(cs.E, cs.H, cs.I, cs.K, cs.M, 0x9ACADE + cs.E + cs.M + bits + 77 * sf,
-                                    false, false, bits, 16, sf);
+                                    false, false, bits, 16, sf, rit);
       c.alloc();
       GlmMoeLayer layer(c.dev_w, c.cfg, std::max(cs.M, 1), /*decode_slots=*/cs.M,
                         /*graph_table_slots=*/1);
@@ -2457,8 +2536,147 @@ DGPP_TEST(moe_decode_slot_path_is_bitwise_host_path_packq) {
               "packq prefill path must be bitwise-identical to enqueue");
       c.free_all();
       std::printf("[ OK ] packq int%d%s decode slot path E=%d H=%d I=%d K=%d M=%d: bitwise\n",
-                  bits, sf ? " g128/f16" : "", cs.E, cs.H, cs.I, cs.K, cs.M);
+                  bits, sf == 1 ? " g128/f16" : sf == 2 ? " nf4i8+h32" : "", cs.E, cs.H, cs.I, cs.K, cs.M);
     }
+}
+
+DGPP_TEST(moe_mixed346_expert_path_matches_oracle) {
+  // The Mixed346 layer through the grouped GEMV chain (every form on one
+  // layer: the seven width pairs and an existing int4 expert, the shared
+  // int8 triple) against the double oracle, and the decode slot path
+  // bitwise the host chain (one and several decode rows, the graph table,
+  // the short prefill).
+  for (auto [E, H, I, K, M] : std::vector<std::tuple<int, int, int, int, int>>{
+           {8, 256, 128, 2, 1}, {8, 256, 128, 2, 3}, {8, 512, 256, 3, 6}, {16, 1024, 512, 4, 5}}) {
+    std::vector<const char*> forms(static_cast<size_t>(E));
+    for (int e = 0; e < E; ++e) forms[static_cast<size_t>(e)] = kM346Forms[e % 8];
+    SmallCase c = make_small_case(E, H, I, K, M, 0x346A8 + E + 7 * M, false, false, 0, 16, 0, 0, forms.data());
+    c.alloc();
+    const std::string label = "mixed346 expert path E=" + std::to_string(E) + " H=" + std::to_string(H) +
+                              " I=" + std::to_string(I) + " M=" + std::to_string(M);
+    run_small_case(c, label.c_str(), dgpp::MoeExpertKernel::kGemv);
+    std::vector<uint16_t> host(static_cast<size_t>(M) * c.cfg.hidden);
+    std::memcpy(host.data(), c.d_out, host.size() * 2);
+    GlmMoeLayer layer(c.dev_w, c.cfg, std::max(M, 1), /*decode_slots=*/M, /*graph_table_slots=*/1);
+    DGPP_CUDA_OK(cudaMemset(c.d_out, 0x7F, host.size() * 2));
+    layer.enqueue_decode(c.d_hidden, c.d_out, M, nullptr, nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    std::vector<uint16_t> slot(host.size());
+    std::memcpy(slot.data(), c.d_out, slot.size() * 2);
+    require(host == slot, "mixed346 decode slot path bitwise the host chain");
+    layer.prepare_graph_table(0, nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    DGPP_CUDA_OK(cudaMemset(c.d_out, 0x7F, host.size() * 2));
+    layer.enqueue_decode(c.d_hidden, c.d_out, M, nullptr, nullptr, /*table_slot=*/0);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    std::memcpy(slot.data(), c.d_out, slot.size() * 2);
+    require(host == slot, "mixed346 decode slot path on the graph table bitwise the host chain");
+    DGPP_CUDA_OK(cudaMemset(c.d_out, 0x7F, host.size() * 2));
+    layer.enqueue_prefill(c.d_hidden, c.d_out, M, nullptr, nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    std::memcpy(slot.data(), c.d_out, slot.size() * 2);
+    require(host == slot, "mixed346 prefill path bitwise the host chain");
+    c.free_all();
+    std::printf("[ OK ] %s: oracle, slot path, graph table, prefill\n", label.c_str());
+  }
+  // A layer whose routed experts are all existing (the baseline form under
+  // the int8 transform) still runs — the slot kernels' plain path alone.
+  {
+    std::vector<const char*> forms(8, "existing");
+    SmallCase c = make_small_case(8, 256, 128, 2, 2, 0x3460, false, false, 0, 16, 0, 0, forms.data());
+    c.alloc();
+    run_small_case(c, "mixed346 all-existing layer", dgpp::MoeExpertKernel::kGemv);
+    c.free_all();
+  }
+}
+
+DGPP_TEST(moe_mixed346_input_sensitivity_probe) {
+  // How much of a one-ulp change of one input element reaches the output,
+  // per format: the int8 activation codes make the layer less tolerant of
+  // upstream noise than bf16 activations (a flipped code), which the TP,
+  // decode and parity gates' budgets must account for. Printed, not gated.
+  for (int form : {0, 2, 3}) {
+    const int E = 8, H = 512, I = 256, K = 2, M = 6;
+    std::vector<const char*> forms(static_cast<size_t>(E));
+    for (int e = 0; e < E; ++e) forms[static_cast<size_t>(e)] = kM346Forms[e % 8];
+    SmallCase c = form == 3 ? make_small_case(E, H, I, K, M, 0x5E15, false, false, 0, 16, 0, 0, forms.data())
+                            : make_small_case(E, H, I, K, M, 0x5E15, false, false, 4, 16, form,
+                                              form == 2 ? dgpp::kMoeInputHadamard32 : dgpp::kMoeInputPlain);
+    c.alloc();
+    GlmMoeLayer layer(c.dev_w, c.cfg, M, /*decode_slots=*/M);
+    layer.enqueue(c.d_hidden, c.d_out, M, nullptr);
+    DGPP_CUDA_OK(cudaDeviceSynchronize());
+    std::vector<uint16_t> base(static_cast<size_t>(M) * H);
+    std::memcpy(base.data(), c.d_out, base.size() * 2);
+    double e2_sum = 0, n2_sum = 0, worst = 0;
+    int trials = 0, changed = 0;
+    for (int t = 0; t < M; ++t)
+      for (int j : {0, 77, 300}) {
+        const size_t at = static_cast<size_t>(t) * H + j;
+        const uint16_t saved = c.d_hidden[at];
+        c.d_hidden[at] = static_cast<uint16_t>(saved + 1);  // one bf16 ulp
+        layer.enqueue(c.d_hidden, c.d_out, M, nullptr);
+        DGPP_CUDA_OK(cudaDeviceSynchronize());
+        c.d_hidden[at] = saved;
+        double e2 = 0, n2 = 0;
+        for (size_t i = static_cast<size_t>(t) * H; i < static_cast<size_t>(t + 1) * H; ++i) {
+          const double a = bf16_to_float(c.d_out[i]), b = bf16_to_float(base[i]);
+          e2 += (a - b) * (a - b);
+          n2 += b * b;
+          changed += c.d_out[i] != base[i];
+        }
+        worst = std::max(worst, std::sqrt(e2 / std::max(n2, 1e-30)));
+        e2_sum += e2;
+        n2_sum += n2;
+        ++trials;
+      }
+    std::printf("[ .. ] input sensitivity (%s): row l2 response to one input ulp: mean %.3g worst %.3g, %d of %d elements changed\n",
+                form == 3 ? "mixed346 int8 codes" : form == 2 ? "nf4i8+h32 bf16" : "int4 bf16",
+                std::sqrt(e2_sum / std::max(n2_sum, 1e-30)), worst, changed, trials * H);
+    c.free_all();
+  }
+}
+
+DGPP_TEST(moe_mixed346_sliced_ranks_fold_matches_unsliced_oracle) {
+  struct Case {
+    int E, H, I, K, M, world;
+  };
+  const Case cases[] = {
+      {8, 256, 256, 2, 3, 2},    // slice 128 (down k=128)
+      {16, 1024, 512, 4, 2, 4},  // slice 128, four ranks
+      {8, 512, 512, 2, 4, 2},    // slice 256
+  };
+  for (const Case& cs : cases) {
+    std::vector<const char*> forms(static_cast<size_t>(cs.E));
+    for (int e = 0; e < cs.E; ++e) forms[static_cast<size_t>(e)] = kM346Forms[e % 8];
+    SmallCase c = make_small_case(cs.E, cs.H, cs.I, cs.K, cs.M, 0x346F0 + cs.E + cs.world, false, false, 0, 16, 0,
+                                  0, forms.data());
+    c.alloc();
+    std::vector<uint16_t> oracle;
+    dgpp::glm_moe_ref_forward(c.d_hidden, c.host_w, c.cfg, c.tokens, oracle);
+    std::vector<std::vector<uint16_t>> partials;
+    for (int rank = 0; rank < cs.world; ++rank) {
+      RankSlice slice = RankSlice::make(c, rank, cs.world);
+      GlmMoeLayer layer(slice.dev_w, c.cfg, cs.M, /*decode_slots=*/cs.M);
+      const size_t n = static_cast<size_t>(cs.M) * cs.H;
+      layer.enqueue(c.d_hidden, slice.d_out, cs.M, nullptr);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      std::vector<uint16_t> host(n);
+      std::memcpy(host.data(), slice.d_out, n * 2);
+      DGPP_CUDA_OK(cudaMemset(slice.d_out, 0x7F, n * 2));
+      layer.enqueue_decode(c.d_hidden, slice.d_out, cs.M, nullptr, nullptr);
+      DGPP_CUDA_OK(cudaDeviceSynchronize());
+      std::vector<uint16_t> slot(n);
+      std::memcpy(slot.data(), slice.d_out, n * 2);
+      require(host == slot, "mixed346 sliced rank: decode slot path bitwise the host path");
+      partials.push_back(std::move(host));
+      slice.free_all();
+    }
+    const std::vector<uint16_t> folded = fold_ranks(partials);
+    require_within_fold_budget(folded, partials, oracle,
+                               ("mixed346 sliced fold E=" + std::to_string(cs.E) + " world=" + std::to_string(cs.world)).c_str());
+    c.free_all();
+  }
 }
 
 DGPP_TEST(moe_sliced_ranks_fold_matches_unsliced_oracle_packq) {
@@ -2470,11 +2688,13 @@ DGPP_TEST(moe_sliced_ranks_fold_matches_unsliced_oracle_packq) {
       {16, 1024, 512, 4, 2, 4},  // slice 128, four ranks
       {8, 512, 512, 2, 4, 2},    // slice 256
   };
-  for (int sf : {0, 1})
+  for (int sf : {0, 1, 2})
   for (int bits : {4, 8})
     for (const Case& cs : cases) {
+      if (sf == 2 && bits != 4) continue;
+      const int rit = sf == 2 ? dgpp::kMoeInputHadamard32 : dgpp::kMoeInputPlain;
       SmallCase c = make_small_case(cs.E, cs.H, cs.I, cs.K, cs.M, 0x511F9 + cs.E + cs.world + bits + 77 * sf,
-                                    false, false, bits, 16, sf);
+                                    false, false, bits, 16, sf, rit);
       c.alloc();
       std::vector<uint16_t> oracle;
       dgpp::glm_moe_ref_forward(c.d_hidden, c.host_w, c.cfg, c.tokens, oracle);
@@ -2499,8 +2719,8 @@ DGPP_TEST(moe_sliced_ranks_fold_matches_unsliced_oracle_packq) {
       const std::vector<uint16_t> folded = fold_ranks(partials);
       require_within_fold_budget(
           folded, partials, oracle,
-          ("packq int" + std::to_string(bits) + " sliced fold E=" + std::to_string(cs.E) +
-           " I=" + std::to_string(cs.I) + " world=" + std::to_string(cs.world)).c_str());
+          ("packq int" + std::to_string(bits) + (sf == 2 ? " nf4i8+h32" : "") + " sliced fold E=" +
+           std::to_string(cs.E) + " I=" + std::to_string(cs.I) + " world=" + std::to_string(cs.world)).c_str());
       c.free_all();
     }
 }

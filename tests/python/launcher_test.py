@@ -314,6 +314,85 @@ class LauncherScanTest(unittest.TestCase):
         self.assertIn("another launcher", result.stdout + result.stderr)
         self.assertIsNone(proc.poll())
 
+    def test_up_reports_early_exit_and_complete_error_without_readiness_timeout(self):
+        config = self.root / "fails.json"
+        config.write_text(json.dumps({"model": "org/model", "world_size": 1}))
+        binary = self.root / "fails"
+        detail = "ERROR serve: " + "memory plan detail; " * 20 + "lower engine.prefix_cache_gib"
+        binary.write_text(f"#!{sys.executable}\nprint({detail!r}, flush=True)\nraise SystemExit(42)\n")
+        binary.chmod(0o755)
+        result = subprocess.run(
+            [sys.executable, str(LAUNCHER), "up", "--config", str(config),
+             "--bin", str(binary), "--skip-preflight"],
+            env=self.environ, text=True, capture_output=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("rank 0 exited with status 42", result.stdout)
+        self.assertIn(detail, result.stdout)
+        self.assertIn("rank 0 log:", result.stdout)
+        self.assertNotIn("TIMEOUT", result.stdout)
+        self.assertNotIn("READY", result.stdout)
+
+    def test_dead_head_cannot_pass_a_readiness_marker_in_its_log(self):
+        namespace = self.namespace("dead", "org/model")
+        cluster = self.cluster(namespace)
+        log = namespace / "serve_r0.log"
+        log.write_text("journal: listening\nserve: listening on :18080\n")
+        proc = self.launch(namespace)
+        self.kill(proc)
+        for marker, label in (("journal: listening", "journal listening"),
+                              ("listening on :18080", "rank 0 serving")):
+            with self.subTest(marker=marker), patch("time.sleep") as sleep, \
+                    redirect_stdout(io.StringIO()) as output:
+                self.assertFalse(cluster.wait_log(log, marker, 600, label, proc))
+            sleep.assert_not_called()
+            self.assertIn("rank 0 exited with status", output.getvalue())
+            self.assertNotIn(": ok", output.getvalue())
+
+    def test_startup_progress_and_readiness(self):
+        namespace = self.namespace("loading", "org/model")
+        cluster = self.cluster(namespace)
+        proc = self.launch(namespace)
+        log = namespace / "serve_r0.log"
+        log.write_text("INFO loading model weights\n")
+        clock = [0.0]
+
+        def advance(seconds):
+            clock[0] += seconds
+            if clock[0] == 12:
+                with log.open("a") as output:
+                    output.write("INFO serve: listening on :18080\n")
+
+        with patch("time.monotonic", side_effect=lambda: clock[0]), \
+                patch("time.sleep", side_effect=advance), redirect_stdout(io.StringIO()) as output:
+            self.assertTrue(cluster.wait_log(log, "listening on :18080", 600, "rank 0 serving", proc))
+        out = output.getvalue()
+        self.assertIn(f"rank 0 log: {log}", out)
+        self.assertIn(f"10s elapsed; rank 0 pid {proc.pid} still running", out)
+        self.assertIn("latest rank 0 log: INFO loading model weights", out)
+        self.assertIn("rank 0 serving: ok (12s)", out)
+
+    def test_startup_timeout_reports_silent_process_and_uses_elapsed_time(self):
+        namespace = self.namespace("silent", "org/model")
+        cluster = self.cluster(namespace)
+        proc = self.launch(namespace)
+        log = namespace / "serve_r0.log"
+        clock = [0.0]
+
+        def advance(seconds):
+            clock[0] += seconds
+
+        for missing in (False, True):
+            if missing:
+                log.unlink()
+            clock[0] = 0.0
+            with self.subTest(missing=missing), patch("time.monotonic", side_effect=lambda: clock[0]), \
+                    patch("time.sleep", side_effect=advance), redirect_stdout(io.StringIO()) as output:
+                self.assertFalse(cluster.wait_log(log, "journal: listening", 11, "journal listening", proc))
+            self.assertEqual(clock[0], 11)
+            self.assertIn("10s elapsed", output.getvalue())
+            self.assertIn("rank 0 has not written any log output yet", output.getvalue())
+            self.assertIn("TIMEOUT waiting for journal listening (11s)", output.getvalue())
+
     def check_peer_staging(self, shell):
         cluster = self.cluster(self.namespace("staging", "org/peer"), peers=1)
         run = subprocess.run

@@ -189,6 +189,16 @@ ClusterConfig parse_cluster_config(const std::string& json, const std::string& w
           if (e.embed_sharding != "replicated" && e.embed_sharding != "vocab")
             fail(what, "'" + ek + "' must be \"replicated\" or \"vocab\"");
         }
+        else if (p.key == "attention_weights") {
+          e.attention_weights = text(x, ek, what);
+          if (e.attention_weights != "checkpoint" && e.attention_weights != "int4")
+            fail(what, "'" + ek + "' must be \"checkpoint\" or \"int4\"");
+        }
+        else if (p.key == "mtp_head") {
+          e.mtp_head = text(x, ek, what);
+          if (e.mtp_head != "checkpoint" && e.mtp_head != "fp8")
+            fail(what, "'" + ek + "' must be \"checkpoint\" or \"fp8\"");
+        }
         else if (p.key == "ngram_table") {
           e.ngram_table = text(x, ek, what);
           if (e.ngram_table != "resident" && e.ngram_table != "mmap")

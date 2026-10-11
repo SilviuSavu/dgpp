@@ -32,6 +32,12 @@ revisions recorded with them.
 
 ## Serving support
 
+Completion responses expose llama.cpp-style `timings`, including final stream
+chunks without usage opt-in. The response calculations preserve existing usage,
+JSON metrics, Prometheus and log semantics. See the
+[API contract](docs/openai-compatibility.md#completion-timings-dgpp-extension)
+and [validation record](benchmarks/results/2026-10-08-completion-timings.md).
+
 Assistant history accepts Anthropic-style thinking parts forwarded through
 LiteLLM, folding their text into `reasoning_content` and dropping redacted
 payloads. Explicit reasoning strings take precedence. Host regressions cover

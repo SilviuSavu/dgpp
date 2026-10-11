@@ -10,6 +10,7 @@
 
 #include "common/cuda_check.hpp"
 #include "common/log.hpp"
+#include "loaders/fp8_quant.hpp"
 #include "loaders/packq_quant.hpp"
 
 namespace dgpp {
@@ -65,24 +66,32 @@ struct GlmDsaLoaderFamily::Builder : WeightBuilder<GlmDsaExpectedTensor> {
   bool replicated(const GlmDsaExpectedTensor& e) const override { return is_replicated(e); }
 
   // ---- the packed triple's geometry ----------------------------------------
+  // The scale record's expected entry names the triple's form (scale_fmt:
+  // the compressed-tensors bf16-per-64 triple under `weight_packed`, or
+  // the NF4I8 codebook's bf16-per-128 triple under `weight_indices`); the
+  // words tensor's name and the group follow it.
   struct PackedSource {
     const GlmDsaExpectedTensor* words;
     const GlmDsaExpectedTensor* scales;
     const GlmDsaExpectedTensor* shape;
     int64_t N, K;
     int bits;
+    int scale_fmt;
+    int group;
   };
   PackedSource packed_source(const std::string& base) {
     PackedSource s;
-    s.words = &expected(base + ".weight_packed");
     s.scales = &expected(base + ".weight_scale");
+    s.scale_fmt = s.scales->scale_fmt;
+    s.group = packed_scale_group(s.scale_fmt);
+    s.words = &expected(base + glm_dsa_packed_words_suffix(s.scale_fmt));
     s.shape = &expected(base + ".weight_shape");
     s.bits = s.words->bits;
-    if (s.bits != 4 && s.bits != 8) fail("'" + base + "' is not a packed matrix");
+    if (!packed_bits_allowed(s.scale_fmt, s.bits)) fail("'" + base + "' is not a packed matrix");
     s.N = s.words->shape[0];
     s.K = s.words->shape[1] * 32 / s.bits;
-    packed_check_cols(s.K, s.bits, who.c_str());
-    if (s.scales->shape[0] != s.N || s.scales->shape[1] != s.K / kPackedGroup)
+    packed_check_cols(s.K, s.bits, who.c_str(), s.scale_fmt);
+    if (s.scales->shape[0] != s.N || s.scales->shape[1] != s.K / s.group)
       fail("packed scale geometry mismatch on " + base);
     // The shape record: read (16 bytes, replicated) and checked against
     // the packed geometry in copy mode; counted in both.
@@ -103,7 +112,7 @@ struct GlmDsaLoaderFamily::Builder : WeightBuilder<GlmDsaExpectedTensor> {
   // and scales at row offset `dst_row` of a (possibly larger) allocation.
   void copy_packed_rows(const PackedSource& s, int64_t row_start, int64_t rows, uint32_t* words_dst,
                         uint16_t* scales_dst, int64_t dst_row) {
-    const size_t wpr = static_cast<size_t>(s.K * s.bits / 32), spr = static_cast<size_t>(s.K / kPackedGroup);
+    const size_t wpr = static_cast<size_t>(s.K * s.bits / 32), spr = static_cast<size_t>(s.K / s.group);
     check_range(s.words->name, row_start, rows, s.N);
     if (copy) {
       const TensorInfo& tw = source(s.words->name);
@@ -121,13 +130,15 @@ struct GlmDsaLoaderFamily::Builder : WeightBuilder<GlmDsaExpectedTensor> {
     note_read(*s.scales, static_cast<size_t>(rows) * spr * 2);
   }
 
-  GlmPackedMatrix alloc_packed(int64_t rows, int64_t cols, int bits) {
+  GlmPackedMatrix alloc_packed(int64_t rows, int64_t cols, int bits, int scale_fmt) {
     GlmPackedMatrix q;
     q.rows = rows;
     q.cols = cols;
     q.bits = bits;
+    q.scale_fmt = scale_fmt;
     q.packed = static_cast<const uint32_t*>(bump.alloc(static_cast<size_t>(rows) * static_cast<size_t>(cols * bits / 32) * 4));
-    q.scales = static_cast<const uint16_t*>(bump.alloc(static_cast<size_t>(rows) * static_cast<size_t>(cols / kPackedGroup) * 2));
+    q.scales = static_cast<const uint16_t*>(
+        bump.alloc(static_cast<size_t>(rows) * static_cast<size_t>(cols / packed_scale_group(scale_fmt)) * 2));
     return q;
   }
 
@@ -135,24 +146,26 @@ struct GlmDsaLoaderFamily::Builder : WeightBuilder<GlmDsaExpectedTensor> {
   // independent: no alignment).
   GlmPackedMatrix load_packq_rows(const std::string& base, int64_t row_start, int64_t rows) {
     const PackedSource s = packed_source(base);
-    GlmPackedMatrix q = alloc_packed(rows, s.K, s.bits);
+    GlmPackedMatrix q = alloc_packed(rows, s.K, s.bits, s.scale_fmt);
     copy_packed_rows(s, row_start, rows, const_cast<uint32_t*>(q.packed), const_cast<uint16_t*>(q.scales), 0);
     return q;
   }
 
   // Columns [col_start, +cols) of every row of the [N, K] packed matrix
-  // `base`, packed: col_start and cols on 64-group boundaries (a group is
-  // also whole words at either width).
+  // `base`, packed: col_start and cols on the triple's group boundaries
+  // (a group is also whole words at either width, and whole 32-wide
+  // rotation blocks under the codebook format).
   GlmPackedMatrix load_packq_cols(const std::string& base, int64_t col_start, int64_t cols) {
     const PackedSource s = packed_source(base);
-    packed_check_cols(cols, s.bits, who.c_str());
-    if (col_start % kPackedGroup != 0)
-      fail("packed column slice of '" + base + "' must start on a 64-element group boundary");
+    packed_check_cols(cols, s.bits, who.c_str(), s.scale_fmt);
+    if (col_start % s.group != 0)
+      fail("packed column slice of '" + base + "' must start on a " + std::to_string(s.group) +
+           "-element group boundary");
     check_range(base, col_start, cols, s.K);
     const size_t wpr_full = static_cast<size_t>(s.K * s.bits / 32), wpr = static_cast<size_t>(cols * s.bits / 32);
-    const size_t spr_full = static_cast<size_t>(s.K / kPackedGroup), spr = static_cast<size_t>(cols / kPackedGroup);
-    const size_t w0 = static_cast<size_t>(col_start * s.bits / 32), s0 = static_cast<size_t>(col_start / kPackedGroup);
-    GlmPackedMatrix q = alloc_packed(s.N, cols, s.bits);
+    const size_t spr_full = static_cast<size_t>(s.K / s.group), spr = static_cast<size_t>(cols / s.group);
+    const size_t w0 = static_cast<size_t>(col_start * s.bits / 32), s0 = static_cast<size_t>(col_start / s.group);
+    GlmPackedMatrix q = alloc_packed(s.N, cols, s.bits, s.scale_fmt);
     if (copy) {
       const TensorInfo& tw = source(s.words->name);
       const TensorInfo& ts = source(s.scales->name);
@@ -177,13 +190,70 @@ struct GlmDsaLoaderFamily::Builder : WeightBuilder<GlmDsaExpectedTensor> {
     return q;
   }
 
+  // engine.attention_weights = int4 (2026-10-09): rows [row_start, +rows) x
+  // columns [col_start, +cols) of the packed int8 g64 matrix `s`, decoded
+  // from the checkpoint's mapped rows (code x scale in fp32) and re-encoded
+  // at 4 bits g64 with the RTN recipe (loaders/packq_quant.hpp) into `q` at
+  // row dst_row — only the 4-bit triple lands in the arena.
+  void requant_source_int4(const PackedSource& s, int64_t row_start, int64_t rows, int64_t col_start,
+                           int64_t cols, GlmPackedMatrix& q, int64_t dst_row) {
+    if (s.bits != 8 || s.scale_fmt != kPackedScaleBf16G64)
+      fail("attention_weights int4 re-encodes the checkpoint's int8 g64 rows only ('" + s.words->name + "')");
+    if (col_start % kPackedGroup != 0 || cols % kPackedGroup != 0)
+      fail("attention_weights int4: the column slice of '" + s.words->name + "' must be whole 64-element groups");
+    check_range(s.words->name, row_start, rows, s.N);
+    check_range(s.words->name, col_start, cols, s.K);
+    const size_t wpr8 = static_cast<size_t>(s.K * s.bits / 32), spr8 = static_cast<size_t>(s.K / s.group);
+    if (copy) {
+      const TensorInfo& tw = source(s.words->name);
+      const TensorInfo& ts = source(s.scales->name);
+      const uint32_t* sw = static_cast<const uint32_t*>(tw.data);
+      const uint16_t* ss = static_cast<const uint16_t*>(ts.data);
+      uint32_t* hw = bump.host(const_cast<uint32_t*>(q.packed));
+      uint16_t* hs = bump.host(const_cast<uint16_t*>(q.scales));
+      const size_t wpr4 = static_cast<size_t>(cols * 4 / 32), spr4 = static_cast<size_t>(cols / kPackedGroup);
+      std::vector<float> row(static_cast<size_t>(cols));
+      for (int64_t r = 0; r < rows; ++r) {
+        for (int64_t c = 0; c < cols; ++c)
+          row[static_cast<size_t>(c)] = packq_decode(sw, ss, s.K, s.bits, row_start + r, col_start + c, s.scale_fmt);
+        packq_encode_row(row.data(), cols, 4, hw + (dst_row + r) * wpr4, hs + (dst_row + r) * spr4);
+      }
+      consumed(tw);
+      consumed(ts);
+    }
+    note_read(*s.words, static_cast<size_t>(rows) * wpr8 * 4);
+    note_read(*s.scales, static_cast<size_t>(rows) * spr8 * 2);
+  }
+  GlmPackedMatrix requant_rows_int4(const std::string& base, int64_t row_start, int64_t rows) {
+    const PackedSource s = packed_source(base);
+    GlmPackedMatrix q = alloc_packed(rows, s.K, 4, kPackedScaleBf16G64);
+    requant_source_int4(s, row_start, rows, 0, s.K, q, 0);
+    return q;
+  }
+  GlmPackedMatrix requant_cols_int4(const std::string& base, int64_t col_start, int64_t cols) {
+    const PackedSource s = packed_source(base);
+    GlmPackedMatrix q = alloc_packed(s.N, cols, 4, kPackedScaleBf16G64);
+    requant_source_int4(s, 0, s.N, col_start, cols, q, 0);
+    return q;
+  }
+  GlmPackedMatrix requant_fused_int4(const std::string& a, const std::string& b) {
+    const PackedSource sa = packed_source(a);
+    const PackedSource sb = packed_source(b);
+    if (sa.K != sb.K || sa.bits != sb.bits || sa.scale_fmt != sb.scale_fmt)
+      fail("fused packed rows of '" + a + "' and '" + b + "' disagree");
+    GlmPackedMatrix q = alloc_packed(sa.N + sb.N, sa.K, 4, kPackedScaleBf16G64);
+    requant_source_int4(sa, 0, sa.N, 0, sa.K, q, 0);
+    requant_source_int4(sb, 0, sb.N, 0, sb.K, q, sa.N);
+    return q;
+  }
+
   // Rows [row_start, +rows) of the packed matrix `base`, dequantized on the
   // host into a BF16 [rows, K] buffer (plan D6: bf16(code x scale), the
   // one rounding the bridge adds; the reference's own decompression).
   uint16_t* load_packq_rows_dequant_bf16(const std::string& base, int64_t row_start, int64_t rows) {
     const PackedSource s = packed_source(base);
     check_range(s.words->name, row_start, rows, s.N);
-    const size_t wpr = static_cast<size_t>(s.K * s.bits / 32), spr = static_cast<size_t>(s.K / kPackedGroup);
+    const size_t wpr = static_cast<size_t>(s.K * s.bits / 32), spr = static_cast<size_t>(s.K / s.group);
     uint16_t* dst = static_cast<uint16_t*>(bump.alloc(static_cast<size_t>(rows) * static_cast<size_t>(s.K) * 2));
     if (copy) {
       const TensorInfo& tw = source(s.words->name);
@@ -194,7 +264,7 @@ struct GlmDsaLoaderFamily::Builder : WeightBuilder<GlmDsaExpectedTensor> {
       for (int64_t r = 0; r < rows; ++r)
         for (int64_t c = 0; c < s.K; ++c)
           h[static_cast<size_t>(r) * s.K + c] =
-              float_to_bf16_bits(packq_decode(sw, ss, s.K, s.bits, r, c));
+              float_to_bf16_bits(packq_decode(sw, ss, s.K, s.bits, r, c, s.scale_fmt));
       consumed(tw);
       consumed(ts);
     }
@@ -228,8 +298,9 @@ struct GlmDsaLoaderFamily::Builder : WeightBuilder<GlmDsaExpectedTensor> {
   GlmPackedMatrix load_packq_fused(const std::string& a, const std::string& b) {
     const PackedSource sa = packed_source(a);
     const PackedSource sb = packed_source(b);
-    if (sa.K != sb.K || sa.bits != sb.bits) fail("fused packed rows of '" + a + "' and '" + b + "' disagree");
-    GlmPackedMatrix q = alloc_packed(sa.N + sb.N, sa.K, sa.bits);
+    if (sa.K != sb.K || sa.bits != sb.bits || sa.scale_fmt != sb.scale_fmt)
+      fail("fused packed rows of '" + a + "' and '" + b + "' disagree");
+    GlmPackedMatrix q = alloc_packed(sa.N + sb.N, sa.K, sa.bits, sa.scale_fmt);
     copy_packed_rows(sa, 0, sa.N, const_cast<uint32_t*>(q.packed), const_cast<uint16_t*>(q.scales), 0);
     copy_packed_rows(sb, 0, sb.N, const_cast<uint32_t*>(q.packed), const_cast<uint16_t*>(q.scales), sa.N);
     return q;
@@ -251,7 +322,7 @@ struct GlmDsaLoaderFamily::Builder : WeightBuilder<GlmDsaExpectedTensor> {
     if (!rows_slice && start % kPackedGroup != 0)
       fail("requant column slice of '" + base + "' must start on a 64-element group boundary");
     check_range(base, start, count, rows_slice ? N : K);
-    GlmPackedMatrix q = alloc_packed(rows, cols, bits);
+    GlmPackedMatrix q = alloc_packed(rows, cols, bits, kPackedScaleBf16G64);
     if (copy) {
       const TensorInfo& t = source(e.name);
       const uint16_t* src = static_cast<const uint16_t*>(t.data);
@@ -285,10 +356,16 @@ struct GlmDsaLoaderFamily::Builder : WeightBuilder<GlmDsaExpectedTensor> {
     a.q_aln = load_bf16(p + "q_a_layernorm.weight");
     a.kv_aln = load_bf16(p + "kv_a_layernorm.weight");
     if (cfg.attention_bits_of(layer) != 0) {
-      a.qkv_a_packed = load_packq_fused(p + "q_a_proj", p + "kv_a_proj_with_mqa");
-      a.q_b_packed = load_packq_rows(p + "q_b_proj", qb0, qbn);
+      // engine.attention_weights = int4: q_a/kv_a, q_b and o_proj re-encoded
+      // at 4 bits g64 from the checkpoint's int8 rows (kv_b keeps the int8:
+      // it is read through the absorbed-attention kernels, not the packed
+      // core); the checkpoint's own triples otherwise.
+      const bool attn_int4 = GlmDsaLayerStream::attention_weights_int4() && cfg.attention_bits_of(layer) == 8;
+      a.qkv_a_packed = attn_int4 ? requant_fused_int4(p + "q_a_proj", p + "kv_a_proj_with_mqa")
+                                 : load_packq_fused(p + "q_a_proj", p + "kv_a_proj_with_mqa");
+      a.q_b_packed = attn_int4 ? requant_rows_int4(p + "q_b_proj", qb0, qbn) : load_packq_rows(p + "q_b_proj", qb0, qbn);
       a.kv_b = load_packq_rows_dequant_bf16(p + "kv_b_proj", kb0, kbn);
-      a.o_proj_packed = load_packq_cols(p + "o_proj", o0, on);
+      a.o_proj_packed = attn_int4 ? requant_cols_int4(p + "o_proj", o0, on) : load_packq_cols(p + "o_proj", o0, on);
     } else {
       a.qkv_a = load_bf16_fused(p + "q_a_proj.weight", p + "kv_a_proj_with_mqa.weight");
       a.q_b = load_bf16_rows(p + "q_b_proj.weight", qb0, qbn, /*packable=*/true);
@@ -455,6 +532,12 @@ size_t GlmDsaLoaderFamily::globals_bytes(const GlmDsaTextConfig& cfg, int rank, 
   b += align_up_256(static_cast<size_t>(geo.embed_vocab_count) * H * 2);  // embed (the whole table or this rank's rows)
   b += align_up_256(H * 2);                                               // final norm
   b += align_up_256(static_cast<size_t>(geo.lm_vocab_count) * H * 2);
+  if (GlmDsaLayerStream::mtp_head_fp8()) {
+    // The draft head's block-FP8 copy: the codes and the 128 x 128 scales.
+    b += align_up_256(static_cast<size_t>(geo.lm_vocab_count) * H);
+    b += align_up_256(static_cast<size_t>(fp8_quant::scale_rows(geo.lm_vocab_count)) *
+                      static_cast<size_t>(fp8_quant::scale_cols(static_cast<int64_t>(H))) * 4);
+  }
   return b;
 }
 
@@ -514,6 +597,24 @@ void GlmDsaLoaderFamily::build_globals(const GlmDsaTextConfig& cfg, const GlmDsa
   out.lm_head = dst;
   out.lm_vocab_begin = begin;
   out.lm_vocab_count = count;
+  if (GlmDsaLayerStream::mtp_head_fp8()) {
+    // The draft head's block-FP8 copy (engine.mtp_head = fp8): the same
+    // rows encoded from the checkpoint's BF16 — the FP8 releases' recipe
+    // (loaders/fp8_quant.hpp) — resident beside the head's own form.
+    const int64_t H = cfg.hidden_size;
+    GlmQuantMatrix q;
+    q.rows = count;
+    q.cols = H;
+    q.payload = static_cast<const uint8_t*>(bump.alloc(static_cast<size_t>(count) * static_cast<size_t>(H)));
+    q.scales = static_cast<const float*>(
+        bump.alloc(static_cast<size_t>(fp8_quant::scale_rows(count)) * static_cast<size_t>(fp8_quant::scale_cols(H)) * 4));
+    fp8_quant::encode_block128(static_cast<const uint16_t*>(t.data) + static_cast<size_t>(begin) * static_cast<size_t>(H),
+                               static_cast<size_t>(H), count, H, bump.host(const_cast<uint8_t*>(q.payload)),
+                               bump.host(const_cast<float*>(q.scales)));
+    out.lm_head_fp8 = q;
+    DGPP_LOG_INFO("glm_dsa loader: the draft head's block-FP8 copy encoded — {} x {} rows of the lm head ({:.2f} GiB)",
+                  count, H, (static_cast<double>(count) * static_cast<double>(H) + q.scale_bytes()) / (1024.0 * 1024 * 1024));
+  }
 }
 
 template class ResidentLayerStream<GlmDsaLoaderFamily>;
@@ -522,9 +623,16 @@ template class ResidentLayerStream<GlmDsaLoaderFamily>;
 
 namespace {
 bool g_embed_vocab_sharded = false;
+bool g_mtp_head_fp8 = false;
+bool g_attention_weights_int4 = false;
 }  // namespace
 void GlmDsaLayerStream::set_embed_vocab_sharded(bool on) { g_embed_vocab_sharded = on; }
 bool GlmDsaLayerStream::embed_vocab_sharded() { return g_embed_vocab_sharded; }
+void GlmDsaLayerStream::set_mtp_head_fp8(bool on) { g_mtp_head_fp8 = on; }
+bool GlmDsaLayerStream::mtp_head_fp8() { return g_mtp_head_fp8; }
+void GlmDsaLayerStream::set_attention_weights_int4(bool on) { g_attention_weights_int4 = on; }
+bool GlmDsaLayerStream::attention_weights_int4() { return g_attention_weights_int4; }
+bool glm_dsa_attention_weights_int4() { return g_attention_weights_int4; }
 
 GlmDsaLayerStream::GlmDsaLayerStream(const GlmDsaTextConfig& cfg, const std::string& checkpoint_dir,
                                      int rank, int world, GlmDsaResidency residency,

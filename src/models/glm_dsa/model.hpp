@@ -128,6 +128,11 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
   // closed), fresh state, every row's logits; the slot is closed after.
   // capture_layers: every layer's residual output [T, H] in layer_states.
   Outputs forward(const std::vector<int64_t>& token_ids, bool capture_layers = false);
+  // A test's capture of the session walks too (the Qwen families' form):
+  // every session prefill / step keeps its layer rows and DSA selections
+  // (a sync per layer — diagnostics only). Process-wide.
+  static void set_session_capture_layers(bool on) { session_capture_layers_ = on; }
+  inline static bool session_capture_layers_ = false;
   // The draft block over a prompt (the parity gate's surface): the cold
   // forward, then the draft rows q = 0 .. T-2 (token q+1, the hidden at q)
   // with the head on every row — logits [T-1, count], the draft's normed
@@ -270,7 +275,9 @@ class GlmDsaModel : public SessionModel<GlmDsaModel> {
 
   void build_layer_objects(const GlmDsaLayerResident& r);
   DsaLayerWeights dsa_view(const GlmDsaAttnResident& a) const;
-  static GlmMoeWeights moe_view(const GlmDsaMoeResident& m);
+  // `hadamard32`: the layer's routed experts take the H32-rotated input
+  // (the NF4I8 checkpoint's main layers; never the draft).
+  static GlmMoeWeights moe_view(const GlmDsaMoeResident& m, bool hadamard32, bool int8_activations = false);
   int moe_ordinal(int layer) const { return layer - cfg_.first_k_dense_replace; }
   int table_slots() const;
   int pool_layers() const { return cfg_.num_hidden_layers + (mtp_ ? 1 : 0); }

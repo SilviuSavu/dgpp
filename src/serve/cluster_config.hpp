@@ -34,7 +34,7 @@ struct ClusterConfig {
   std::string ssh_user;            // empty: the launcher's own user
   std::string release;             // the installed release the launcher runs (launcher-only; empty: the development binary)
   int http_port = 18080;
-  std::string http_bind = "127.0.0.1";
+  std::string http_bind = "0.0.0.0";
   int64_t http_max_body_bytes = kDefaultHttpMaxBodyBytes;
   int sse_ping_interval = kDefaultSsePingInterval;
   // Local paths and device names may differ by rank; no credentials belong here.
@@ -53,6 +53,19 @@ struct ClusterConfig {
     // per token and summed by one fold (bitwise the same numbers, one
     // small collective per lookup, −1.33 GiB per rank at world 4).
     std::string embed_sharding = "replicated";
+    // The full GLM-5.3 draft block's head (2026-10-09): "checkpoint" reads
+    // the lm head as the main step does (its 12-bit form under
+    // bf16_weights); "fp8" reads a block-FP8 copy encoded at load (e4m3,
+    // 128 x 128 fp32 scales — the FP8 releases' recipe; +0.23 GiB per rank
+    // at world 4). The verifier keeps the main head, so the served
+    // distribution is unchanged; only the draft's proposals (acceptance)
+    // can move. Other families ignore it.
+    std::string mtp_head = "checkpoint";
+    // The full GLM-5.3 attention projections' resident form (2026-10-09):
+    // "checkpoint" as shipped (int8 g64); "int4" re-encoded to int4 g64 at
+    // load (RTN) — −2.1 GB per MTP pass per rank, NOT lossless. Other
+    // families ignore it.
+    std::string attention_weights = "checkpoint";
     // The Qwen n-gram table's residency: "resident" copies it
     // to the device (the default; 47.7 GiB at world 1), "mmap" leaves it
     // on the NVMe behind the page cache and gathers each step's rows on

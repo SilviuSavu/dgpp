@@ -140,7 +140,7 @@ python3 scripts/dgpp-cluster status --config "$CONFIG"
 python3 scripts/dgpp-cluster down --config "$CONFIG"
 ```
 
-HTTP defaults to localhost; deployment `http.bind_host` and `http.port` select
+HTTP defaults to all IPv4 interfaces (`0.0.0.0`); deployment `http.bind_host` and `http.port` select
 another address or port. Use the same config and any `--log-dir` override for
 start, status and stop. Use an SSH tunnel or authenticated TLS proxy for remote
 clients; DGPP has no authentication or TLS.

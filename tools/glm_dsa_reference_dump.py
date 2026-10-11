@@ -102,19 +102,77 @@ def load_bf16(entries, name):
     return shape, values
 
 
+# The NF4I8 codebook (models/quant_matrix.hpp kNf4i8Codebook): a 4-bit
+# `weight_indices` nibble selects a level; one bf16 scale per 128. The
+# Mixed346 contract (kPackedScaleBf16G128Mixed346) stores 3-, 4- or 6-bit
+# indices as a dense bit stream per row: the 3-bit Gaussian codebook, the
+# same 4-bit one, index - 32 at 6 bits.
+NF4I8_CODEBOOK = (-127, -88, -67, -50, -36, -23, -12, 0, 10, 20, 31, 43, 56, 71, 92, 127)
+GAUSS3_CODEBOOK = (-127, -79, -45, -14, 14, 45, 79, 127)
+H32_SCALE = f32(1.0 / math.sqrt(32.0))  # kHadamard32Scale
+
+
+def codebook_level(u, bits):
+    if bits == 3:
+        return GAUSS3_CODEBOOK[u]
+    if bits == 4:
+        return NF4I8_CODEBOOK[u]
+    return u - 32
+
+
+def quant_int8_row(x):
+    """kernels/hadamard32.hpp's activation quantizer on one rotated bf16
+    row, as the values the codes represent: per 128 values the fp32 scale
+    s = max(amax / 127, 1e-30) and the codes clamp(rint(x / s), -128, 127)
+    (ties to even), each code x s in fp32."""
+    out = [0.0] * len(x)
+    for g in range(0, len(x), 128):
+        amax = max(abs(f32(t)) for t in x[g:g + 128])
+        s = max(f32(amax / 127.0), f32(1e-30))
+        for j in range(128):
+            q = round(f32(x[g + j] / s))  # round(): ties to even
+            q = min(max(q, -128), 127)
+            out[g + j] = f32(q * s)
+    return out
+
+
+def hadamard32_quant_int8_row(x):
+    return quant_int8_row(hadamard32_row(x))
+
+
+def hadamard32_row(x):
+    """kernels/hadamard32.hpp's arithmetic on one bf16 row: per 32-block,
+    five fp32 butterflies at strides 1, 2, 4, 8, 16 (element j takes
+    v_j + v_{j^s} with bit s clear, v_{j^s} - v_j with it set), one fp32
+    multiply by 1/sqrt(32), one bf16 rounding."""
+    out = list(x)
+    for b in range(0, len(x), 32):
+        v = [f32(t) for t in x[b:b + 32]]
+        s = 1
+        while s < 32:
+            v = [f32(v[j ^ s] - v[j]) if (j & s) else f32(v[j] + v[j ^ s]) for j in range(32)]
+            s *= 2
+        out[b:b + 32] = [bf16_round(f32(t * H32_SCALE)) for t in v]
+    return out
+
+
 def load_packed(entries, module):
-    """A pack-quantized triple -> rows of the exact code x scale values
-    (the engine's dequant, plan D2): weight_packed I32 [N, K*bits/32]
-    (unsigned codes, low nibble/byte first), weight_scale BF16 [N, K/64],
-    weight_shape I64 [2]."""
-    _, (n, words_per_row), words = load_raw(entries, module + ".weight_packed")
+    """A packed triple -> rows of the exact level x scale values (the
+    engine's dequant, plan D2): weight_packed I32 [N, K*bits/32] (unsigned
+    codes offset 2^(bits-1), low nibble/byte first) with weight_scale BF16
+    [N, K/64], or — the NF4I8 contract — weight_indices I32 [N, K/8]
+    (codebook indices, low nibble first) with weight_scale BF16 [N,
+    K/128]; weight_shape I64 [2] either way."""
+    codebook = module + ".weight_indices" in entries
+    _, (n, words_per_row), words = load_raw(entries, module + (".weight_indices" if codebook else ".weight_packed"))
     _, (n2, groups), scales = load_raw(entries, module + ".weight_scale")
     _, _, shape = load_raw(entries, module + ".weight_shape")
     k = shape[1]
     bits = words_per_row * 32 // k
-    if bits not in (4, 8) or n != shape[0] or n2 != n or groups * 64 != k:
+    group = 128 if codebook else 64
+    widths = (3, 4, 6) if codebook else (4, 8)
+    if bits not in widths or n != shape[0] or n2 != n or groups * group != k or words_per_row * 32 != k * bits:
         raise ValueError("packed shapes disagree for %s" % module)
-    per = 32 // bits
     mask = (1 << bits) - 1
     off = 1 << (bits - 1)
     rows = []
@@ -122,15 +180,23 @@ def load_packed(entries, module):
         row = [0.0] * k
         wbase, sbase = r * words_per_row, r * groups
         for c in range(k):
-            code = ((words[wbase + c // per] >> (bits * (c % per))) & mask) - off
-            row[c] = code * scales[sbase + c // 64]
+            # The stored field: bits [c*bits, +bits) of the row's stream, across a
+            # word boundary at 3 and 6 bits (the 4- and 8-bit fields never cross).
+            pos = c * bits
+            wi, sh = pos // 32, pos % 32
+            u = words[wbase + wi] >> sh
+            if sh + bits > 32:
+                u |= words[wbase + wi + 1] << (32 - sh)
+            u &= mask
+            level = codebook_level(u, bits) if codebook else u - off
+            row[c] = level * scales[sbase + c // group]
         rows.append(row)
     return rows
 
 
 def load_linear(entries, module, n, k):
     """A Linear's rows: the packed triple where present, else the bf16 weight."""
-    if module + ".weight_packed" in entries:
+    if module + ".weight_packed" in entries or module + ".weight_indices" in entries:
         rows = load_packed(entries, module)
         if len(rows) != n or len(rows[0]) != k:
             raise ValueError("%s: packed [%d, %d], expected [%d, %d]" % (module, len(rows), len(rows[0]), n, k))
@@ -154,7 +220,45 @@ def text_config(checkpoint_dir):
     else:
         full = [max(l - offset + 1, 0) % freq == 0 for l in range(L)]
     rp = tc.get("rope_parameters", {})
+    # The NF4I8 contract (src/models/glm_dsa/config.cpp): the routed
+    # experts of layers [lo, hi] take the H32-rotated input.
+    qc = tc.get("quantization_config") or {}
+    h32_layers = None
+    a8_experts = None
+    if qc.get("quant_method") == "dgpp_nf4i8":
+        re_ = qc["routed_experts"]
+        t = re_.get("input_transform") or {}
+        if t.get("type") != "normalized_hadamard" or t.get("block_size") != 32:
+            raise ValueError("dgpp_nf4i8: the reference implements the 32-wide normalized Hadamard rotation")
+        if list(re_["codebook"]) != list(NF4I8_CODEBOOK):
+            raise ValueError("dgpp_nf4i8: the codebook differs from the one the reference implements")
+        h32_layers = (int(re_["layers"][0]), int(re_["layers"][1]))
+    elif qc.get("quant_method") == "dgpp_mixed346":
+        # The Mixed346 contract (src/models/glm_dsa/config.cpp): the recipe
+        # (inline, or the sidecar file) names every packed layer's experts —
+        # a converted one takes the H32-rotated int8 codes, an existing one
+        # the plain rows.
+        if qc.get("format") != "dgpp_mixed346_h32_a8_g128_v1" or qc.get("rotation_size") != 32 or \
+                qc.get("activation_bits") != 8 or qc.get("group_size") != 128:
+            raise ValueError("dgpp_mixed346: the reference implements format dgpp_mixed346_h32_a8_g128_v1")
+        recipe = qc.get("recipe")
+        if recipe is None:
+            with open(os.path.join(checkpoint_dir, qc.get("recipe_file", "quantization-recipe.json"))) as f:
+                recipe = json.load(f)
+        cb = recipe["weight_codebooks"]
+        if [int(v) for v in cb["3"]] != list(GAUSS3_CODEBOOK) or [int(v) for v in cb["4"]] != list(NF4I8_CODEBOOK) or \
+                [int(v) for v in cb["6"]] != [i - 32 for i in range(64)]:
+            raise ValueError("dgpp_mixed346: a codebook differs from the ones the reference implements")
+        table = recipe["layer_expert_recipes"]
+        layers = sorted(int(l) for l in table)
+        h32_layers = (layers[0], layers[-1])
+        a8_experts = {}
+        for l in layers:
+            forms = table[str(l)]
+            a8_experts[l] = [forms[str(e)] != "existing" for e in range(tc["n_routed_experts"])]
     return {
+        "h32_layers": h32_layers,
+        "a8_experts": a8_experts,
         "hidden": tc["hidden_size"], "vocab": tc["vocab_size"], "num_layers": L,
         "first_dense": tc["first_k_dense_replace"], "eps": tc.get("rms_norm_eps", 1e-5),
         "eos": eos[0] if isinstance(eos, list) else eos,
@@ -404,9 +508,18 @@ def attention_forward(cfg, w, x_rows, state, table, pos0, inherited):
     return attention_rows(cfg, w, q_rows, state, sels), sels, margins
 
 
-def layer_forward(cfg, w, h_rows, state, table, pos0, inherited):
-    """h += attn(input_norm(h)); h += mlp(post_norm(h)) — bf16 residual adds."""
+def layer_forward(cfg, w, h_rows, state, table, pos0, inherited, layer=None):
+    """h += attn(input_norm(h)); h += mlp(post_norm(h)) — bf16 residual adds.
+    `layer`: the main-stack index, for the NF4I8 contract's rotated range
+    (the draft, past the range, is never rotated)."""
     eps = cfg["eps"]
+    h32 = cfg.get("h32_layers")
+    rotate = hadamard32_row if (h32 and layer is not None and h32[0] <= layer <= h32[1]) else None
+    a8 = cfg.get("a8_experts")
+    if rotate and a8 is not None:
+        # The Mixed346 layer: per expert, the rotated int8 codes (a converted
+        # expert) or the plain rows (an existing one).
+        rotate = [hadamard32_quant_int8_row if conv else None for conv in a8[layer]]
     x_rows = [rmsnorm2(h, w["input_norm"], eps) for h in h_rows]
     y, sels, margins = attention_forward(cfg, w, x_rows, state, table, pos0, inherited)
     h_rows = [[bf16_round(a + b) for a, b in zip(h, yy)] for h, yy in zip(h_rows, y)]
@@ -417,7 +530,7 @@ def layer_forward(cfg, w, h_rows, state, table, pos0, inherited):
         moe = (w["router"], w["router_bias"], w["experts"], w["shared"])
         E, K = cfg["experts"], cfg["top_k"]
         y, ids, _, biased = moe_reference(x_rows, moe, H, cfg["moe_inter"], K, E,
-                                          math.inf, cfg["norm_topk"], cfg["scaling"])
+                                          math.inf, cfg["norm_topk"], cfg["scaling"], rotate)
         routes = [ids[t * K:(t + 1) * K] for t in range(len(x_rows))]
         # The router's boundary margin per token: the K-th biased score
         # minus the next (sigmoid units) — a flip inside it is noise.
@@ -445,7 +558,7 @@ def reference_forward(cfg, entries, tokens, table, progress=False):
                                        ", indexer" if w["indexer"] else ", shared selection"),
                   file=sys.stderr, flush=True)
         state = DsaState()
-        h, route, sels, marg, rmarg = layer_forward(cfg, w, h, state, table, 0, inherited)
+        h, route, sels, marg, rmarg = layer_forward(cfg, w, h, state, table, 0, inherited, layer)
         layer_states.append([v for row in h for v in row])
         if w["moe"]:
             routes.append(route)

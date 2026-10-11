@@ -153,6 +153,21 @@ print(json.dumps({'arguments': sys.argv[1:],
         self.assertEqual(peer_spec['env']['DGPP_NO_SWAP'], '1')
         self.assertEqual(cfg['node_env'], [{}, {}])
 
+    def test_preflight_respects_resolved_node_swap_policy(self):
+        cfg = {'nodes': ['127.0.0.1', '192.0.2.2'],
+               'node_env': [{'DGPP_NO_SWAP': '1'}, {'DGPP_NO_SWAP': '1'}],
+               'model': 'test/model', 'ports': {}, 'http': {'bind_host': '127.0.0.1'}, 'paths': {}}
+        report = {'rank': 0, 'checks': [], 'devices': []}
+        remote = subprocess.CompletedProcess([], 0, json.dumps({**report, 'rank': 1}), '')
+        with mock.patch.dict(os.environ, {'DGPP_NO_SWAP': '0'}), \
+                mock.patch.object(cluster_doctor, 'probe', return_value=report) as local, \
+                mock.patch.object(cluster_doctor.subprocess, 'run', return_value=remote) as ssh:
+            self.assertEqual(cluster_doctor.check_cluster(cfg, 'binary', '/logs', '/stage', 'user',
+                                                         peer_binary='peer-binary'), 0)
+        self.assertEqual(local.call_args.args[0]['env']['DGPP_NO_SWAP'], '1')
+        peer_spec = json.loads(shlex.split(ssh.call_args.args[0][-1])[-1])
+        self.assertEqual(peer_spec['env']['DGPP_NO_SWAP'], '1')
+
 
 if __name__ == '__main__':
     unittest.main()

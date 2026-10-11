@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -345,6 +346,7 @@ class FakeEngine : public SchedulerEngine {
     live.held_blocks = blocks_for_tokens(tokens);
   }
 
+  std::atomic<int> tokens_per_step{1};  // speculative passes in timing tests
   std::vector<int32_t> step(int req) override {
     // The failure injection (the v1 failure semantics gate): the n-th step
     // call across every slot throws, as a bus watchdog or a journal write
@@ -353,10 +355,14 @@ class FakeEngine : public SchedulerEngine {
       throw std::runtime_error("fake: injected engine failure at step " +
                                std::to_string(fail_at_step_));
     Live& live = live_.at(req);
-    live.last_token = next_token(live, live.served);
-    note_logprobs(req, live.last_token, live.served);
-    ++live.served;
-    return {live.last_token};
+    std::vector<int32_t> tokens;
+    for (int i = 0; i < tokens_per_step.load(); ++i) {
+      live.last_token = next_token(live, live.served);
+      note_logprobs(req, live.last_token, live.served);
+      ++live.served;
+      tokens.push_back(live.last_token);
+    }
+    return tokens;
   }
   void fail_at_step(int n) { fail_at_step_ = n; }
 
@@ -636,6 +642,33 @@ class Client {
     }
     return out;
   }
+  // Read a complete HTTP response without depending on connection closure
+  // or on the JSON fitting in a single recv().
+  std::string read_response(int budget_ms) {
+    std::string out;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(budget_ms);
+    while (std::chrono::steady_clock::now() < deadline && !closed_) {
+      const auto headers = out.find("\r\n\r\n");
+      if (headers != std::string::npos) {
+        const auto length = out.find("Content-Length: ");
+        if (length < headers) {
+          const auto bytes = std::strtoull(out.c_str() + length + 16, nullptr, 10);
+          if (out.size() >= headers + 4 + bytes) return out;
+        } else if (out.ends_with("\r\n0\r\n\r\n")) {
+          return out;
+        }
+      }
+      pollfd p{fd_, POLLIN, 0};
+      if (::poll(&p, 1, 25) > 0) {
+        char buf[4096];
+        const ssize_t got = ::recv(fd_, buf, sizeof(buf), 0);
+        if (got > 0) out.append(buf, static_cast<size_t>(got));
+        if (got == 0) closed_ = true;
+      }
+    }
+    throw std::runtime_error("incomplete HTTP response: " + out);
+  }
   void hard_close() {
     ::shutdown(fd_, SHUT_RDWR);
     ::close(fd_);
@@ -777,6 +810,16 @@ std::string fake_text(size_t prompt_len, int n) {
   for (int i = 0; i < n; ++i)
     out.push_back(static_cast<char>(fake_token(prompt_len, i)));
   return out;
+}
+
+// The double behind `"key":<number>` in a response body, or -1 when the
+// key is absent. The timings windows are wall clock, so the checks are of
+// their arithmetic, never of their values.
+double json_number(const std::string& resp, const std::string& key) {
+  const size_t at = resp.find(key);
+  return at == std::string::npos
+             ? -1
+             : std::strtod(resp.c_str() + at + key.size(), nullptr);
 }
 
 void post_completion(Client& client, bool chat, const std::string& extra, int tokens = 3) {
@@ -972,6 +1015,23 @@ DGPP_TEST(serve_chatNonStream_exactCompletionShape) {
   require(resp.find("\"prompt_tokens\":4,\"completion_tokens\":3,"
                     "\"total_tokens\":7") != std::string::npos,
           "usage arithmetic: " + resp);
+  // Response timings count uncached prompt work and exclude the prefill
+  // pick from decode rates. Usage continues counting every generated token.
+  require(resp.find("\"timings\":{\"prompt_n\":4,\"cache_n\":0,"
+                    "\"predicted_n\":3,") != std::string::npos,
+          "timings counters: " + resp);
+  const double prompt_ms = json_number(resp, "\"prompt_ms\":");
+  const double predicted_ms = json_number(resp, "\"predicted_ms\":");
+  require(prompt_ms > 0, "prompt_ms measures the admission-to-first-token window");
+  require(predicted_ms >= 0, "predicted_ms present");
+  require(std::fabs(json_number(resp, "\"prompt_per_token_ms\":") -
+                        prompt_ms / 4) <= 1e-6 + 1e-3 * prompt_ms / 4,
+          "prompt_per_token_ms divides prompt_ms by prompt_n");
+  const double predicted_rate =
+      predicted_ms > 0 ? 2 / predicted_ms * 1000 : 0;
+  require(std::fabs(json_number(resp, "\"predicted_per_second\":") -
+                        predicted_rate) <= 1e-6 + 1e-3 * predicted_rate,
+          "predicted_per_second excludes the prefill pick");
 }
 
 DGPP_TEST(serve_chatOneTokenLimit_returnsExactlyOneToken) {
@@ -1024,7 +1084,13 @@ DGPP_TEST(serve_chatStream_chunkLifecycleInOrder) {
       resp.find("\"choices\":[],\"usage\":{\"prompt_tokens\":5,"
                 "\"completion_tokens\":3,\"total_tokens\":8,"
                 "\"prompt_tokens_details\":{\"cached_tokens\":0},"
-                "\"completion_tokens_details\":{\"reasoning_tokens\":0}}");
+                "\"completion_tokens_details\":{\"reasoning_tokens\":0}},"
+                "\"timings\":{\"prompt_n\":5,\"cache_n\":0,"
+                "\"predicted_n\":3,");
+  require(usage != std::string::npos &&
+              resp.find("\"prompt_per_token_ms\"", usage) != std::string::npos &&
+              resp.find("\"predicted_per_second\"", usage) != std::string::npos,
+          "the usage chunk's timings carry the derived rates");
   const size_t done = resp.find("data: [DONE]");
   require(role != std::string::npos, "role chunk present");
   // Concatenate every content payload in arrival order.
@@ -1538,6 +1604,9 @@ DGPP_TEST(serve_legacyCompletions_theTextCompletionObject) {
   require(resp.find("\"prompt_tokens\":5,\"completion_tokens\":2,"
                     "\"total_tokens\":7") != std::string::npos,
           "legacy usage");
+  require(resp.find("\"timings\":{\"prompt_n\":5,\"cache_n\":0,"
+                    "\"predicted_n\":2,") != std::string::npos,
+          "legacy timings: " + resp);
 }
 
 // The checkpoint's defaults for the sampling rigs (generation_config.json:
@@ -4547,6 +4616,203 @@ DGPP_TEST(serve_streamPreamble_waitsForOutput) {
     require(content != std::string::npos && first < content &&
                 content < response.find(R"("finish_reason":"length")"),
             "delayed preamble precedes the first output: " + response);
+  }
+}
+
+namespace {
+
+std::string timing_completion(ServiceRig& rig, bool chat, const std::string& prompt,
+                              int tokens, const std::string& extra = "") {
+  const std::string body = chat ? chat_body(prompt, tokens, extra)
+      : "{\"model\":\"" + kModel + "\",\"prompt\":\"" + prompt +
+        "\",\"max_tokens\":" + std::to_string(tokens) + extra + "}";
+  Client client(rig.port());
+  client.send_all(std::string("POST /v1/") + (chat ? "chat/completions" : "completions") +
+      " HTTP/1.1\r\nHost: t\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: " +
+      std::to_string(body.size()) + "\r\n\r\n" + body);
+  const auto response = client.read_response(5000);
+  require(response.starts_with("HTTP/1.1 200 OK"), "timing request succeeded: " + response);
+  return response;
+}
+
+void timing_near(double actual, double expected, const std::string& message) {
+  require(std::isfinite(actual) && actual >= 0 &&
+              std::fabs(actual - expected) <= 1e-6 + 1e-9 * std::fabs(expected), message);
+}
+
+void require_timing_rates(const std::string& json, int prompt, int cached,
+                          int generated, int choices) {
+  require(json_number(json, "\"prompt_n\":") == prompt - cached &&
+              json_number(json, "\"cache_n\":") == cached &&
+              json_number(json, "\"predicted_n\":") == generated,
+          "response timing counters: " + json);
+  const double prefill = json_number(json, "\"prompt_ms\":");
+  const double decode = json_number(json, "\"predicted_ms\":");
+  require(prefill > 0 && decode >= 0.001, "finite timing windows for generated tokens");
+  timing_near(json_number(json, "\"prompt_per_second\":"),
+              (prompt - cached) * 1000 / prefill, "prefill throughput counts computed tokens");
+  timing_near(json_number(json, "\"prompt_per_token_ms\":"),
+              prefill / (prompt - cached), "prefill latency counts computed tokens");
+  const int decoded = generated - choices;
+  timing_near(json_number(json, "\"predicted_per_second\":"),
+              decoded * 1000 / decode, "decode throughput excludes each choice's prefill pick");
+  timing_near(json_number(json, "\"predicted_per_token_ms\":"),
+              decoded > 0 ? decode / decoded : 0, "decode latency excludes prefill picks");
+}
+
+}  // namespace
+
+DGPP_TEST(serve_timings_cachedRequestsPreserveExistingCounters) {
+  for (bool chat : {false, true}) {
+    ServiceRig rig(8, dgpp::sample::greedy_params(), false, std::nullopt,
+                   false, false, {}, 4);
+    for (int cached : {0, 4}) {
+      const auto response = timing_completion(rig, chat, "ab|cd|ef", 3);
+      require_timing_rates(response, 8, cached, 3, 1);
+      const auto parsed = dgpp::minijson::parse(
+          std::string_view(response).substr(response.find("\r\n\r\n") + 4));
+      const auto& usage = parsed.root.at("usage");
+      require(usage.at("prompt_tokens").as_int() == 8 &&
+                  usage.at("completion_tokens").as_int() == 3 &&
+                  usage.at("total_tokens").as_int() == 11 &&
+                  usage.at("prompt_tokens_details").at("cached_tokens").as_int() == cached,
+              "usage retains full prompt and completion counts on both endpoints");
+    }
+    // The HTTP response can finish before engine_pass publishes its meters.
+    for (int i = 0; i < 1000 && rig.service.meters().prompts_prefilled != 2; ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    Client metrics(rig.port());
+    metrics.send_all("GET /v1/metrics HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    const auto response = metrics.read_response(3000);
+    const auto parsed = dgpp::minijson::parse(
+        std::string_view(response).substr(response.find("\r\n\r\n") + 4));
+    const auto& scheduler = parsed.root.at("scheduler");
+    require(scheduler.at("prompt_tokens").as_int() == 16 &&
+                scheduler.at("prompt_tokens_computed").as_int() == 12 &&
+                scheduler.at("tokens_generated").as_int() == 6,
+            "JSON metrics preserve total/computed/generated definitions");
+    Client prometheus(rig.port());
+    prometheus.send_all("GET /metrics/prometheus HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    const auto exposition = prometheus.read_response(3000);
+    for (const auto& [name, count] : {
+         std::pair{"dgpp_prompt_tokens_total", 16}, {"dgpp_prompt_tokens_computed_total", 12},
+         {"dgpp_prompt_tokens_cached_total", 4}, {"dgpp_generation_tokens_total", 6}}) {
+      require(exposition.find(std::string(name) + "{model_name=\"" + kModel + "\"} " +
+                                  std::to_string(count) + "\n") != std::string::npos,
+              "Prometheus preserves existing counter " + std::string(name));
+    }
+  }
+}
+
+DGPP_TEST(serve_timings_excludeQueueAndPreserveLatencyHistograms) {
+  for (bool resumed : {false, true}) {
+    dgpp::sched::AdmissionPolicy policy;
+    if (resumed) policy.prefill_budget_tokens = 8;
+    ServiceRig rig(8, dgpp::sample::greedy_params(), false, std::nullopt,
+                   false, false, policy, 0, {}, std::nullopt, 0, 0, resumed);
+    rig.gate = true;
+    rig.pass_delay_ms = 2;
+    Client client(rig.port());
+    const auto body = chat_body(std::string(40, 'a'), 3);
+    client.send_all("POST /v1/chat/completions HTTP/1.1\r\nHost: t\r\nConnection: close\r\nContent-Length: " +
+                    std::to_string(body.size()) + "\r\n\r\n" + body);
+    for (int i = 0; i < 1000 && rig.service.stats().requests_total == 0; ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    require(rig.service.stats().requests_total == 1, "request reaches gated admission queue");
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    rig.gate = false;
+    const auto response = client.read_response(5000);
+    require_timing_rates(response, 40, 0, 3, 1);
+    const auto stats = rig.service.stats();
+    const double prompt_ms = json_number(response, "\"prompt_ms\":");
+    require(stats.queue_s.count() == 1 && stats.prefill_s.count() == 1 &&
+                stats.ttft_miss_s.count() == 1 && stats.decode_s.count() == 1 &&
+                stats.tpot_s.count() == 1 && stats.queue_s.sum() > 0,
+            "existing latency histograms retain one observation per request");
+    timing_near(prompt_ms, stats.prefill_s.sum() * 1000,
+                "response prefill uses admission, including all resumed chunks");
+    timing_near(stats.ttft_miss_ms, prompt_ms + stats.queue_s.sum() * 1000,
+                "existing TTFT still includes the queue wait");
+    timing_near(stats.ttft_miss_ms, stats.ttft_miss_s.sum() * 1000,
+                "TTFT counter and histogram keep the same window");
+    timing_near(stats.tpot_s.sum(), stats.decode_s.sum() / 2,
+                "existing TPOT keeps its first-token-to-retirement window");
+    if (resumed) require(rig.engine.chunks_computed > 1, "probe covers resumed prefill");
+  }
+}
+
+DGPP_TEST(serve_timings_streamPlacementPreservesUsageOptIn) {
+  for (bool chat : {false, true}) {
+    for (int choices : {1, 6}) {
+      if (!chat && choices != 1) continue;
+      for (int usage_mode : {-1, 0, 1}) {
+        ServiceRig rig;
+        std::string extra = ",\"stream\":true";
+        if (chat) extra += ",\"n\":" + std::to_string(choices);
+        if (usage_mode >= 0)
+          extra += std::string(",\"stream_options\":{\"include_usage\":") +
+                   (usage_mode ? "true}" : "false}");
+        const auto response = timing_completion(rig, chat, "abcd", 3, extra);
+        size_t at = 0;
+        int timings = 0, usages = 0, finishes = 0, done = 0;
+        bool saw_timings = false;
+        while ((at = response.find("data: ", at)) != std::string::npos) {
+          at += 6;
+          const auto end = response.find("\n\n", at);
+          const auto payload = response.substr(at, end - at);
+          if (payload == "[DONE]") { ++done; break; }
+          require(!saw_timings, "timings appear only on the final JSON event");
+          const auto parsed = dgpp::minijson::parse(payload);
+          const auto& chunk = parsed.root;
+          const auto* usage = chunk.find("usage");
+          const auto& items = chunk.at("choices").items();
+          if (items.empty()) {
+            ++usages;
+            require(usage_mode == 1 && usage != nullptr && usage->is_object(),
+                    "usage-only event still requires opt-in");
+            require(usage->at("prompt_tokens").as_int() == 4 &&
+                        usage->at("completion_tokens").as_int() == 3 * choices,
+                    "stream usage still sums every choice's full completion");
+          } else {
+            if (!items.front().at("finish_reason").is_null()) ++finishes;
+            require(usage_mode == 1 ? usage != nullptr && usage->is_null() : usage == nullptr,
+                    "non-usage events preserve the original usage contract");
+          }
+          if (chunk.find("timings")) {
+            ++timings;
+            saw_timings = true;
+            require_timing_rates(payload, 4, 0, 3 * choices, choices);
+            require(usage_mode == 1 ? items.empty() : finishes == choices,
+                    "timings follow the final choice, on usage or finish as requested");
+          }
+          at = end;
+        }
+        require(timings == 1 && usages == (usage_mode == 1 ? 1 : 0) &&
+                    finishes == choices && done == 1,
+                "one timing object and the existing stream lifecycle on both endpoints");
+      }
+    }
+  }
+}
+
+DGPP_TEST(serve_timings_decodeRatesHandlePrefillOnlyAndSpeculativeChoices) {
+  for (bool chat : {false, true}) {
+    for (int choices : {1, 6}) {
+      if (!chat && choices != 1) continue;
+      for (int tokens : {1, 7}) {
+        ServiceRig rig;
+        rig.engine.tokens_per_step = 3;
+        const auto response = timing_completion(rig, chat, "abcd", tokens,
+            chat ? ",\"n\":" + std::to_string(choices) : "");
+        require_timing_rates(response, 4, 0, tokens * choices, choices);
+        const auto parsed = dgpp::minijson::parse(
+            std::string_view(response).substr(response.find("\r\n\r\n") + 4));
+        require(parsed.root.at("usage").at("completion_tokens").as_int() == tokens * choices,
+                "usage includes prefill picks even when decode throughput is zero");
+        require(parsed.root.at("choices").items().size() == static_cast<size_t>(choices),
+                "every choice remains in the one-shot response");
+      }
+    }
   }
 }
 

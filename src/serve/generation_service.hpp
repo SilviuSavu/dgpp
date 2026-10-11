@@ -417,6 +417,12 @@ class GenerationService : public HttpHandler,
     int completion_tokens = 0;   // summed over the choices
     int reasoning_tokens = 0;
     int cached_tokens = 0;       // choice 0's prefix-cache attach position
+    // Response-only timings, written on the engine thread under mutex_.
+    // Prompt time is choice 0's admission to first token. Decode spans the
+    // earliest first token to the last token across all choices.
+    double prompt_ms = 0;
+    int prefill_tokens = 0;  // one first token per choice that generated any
+    std::chrono::steady_clock::time_point first_token, last_token;
     std::vector<std::string> choices;  // one-shot: each choice's JSON
   };
 

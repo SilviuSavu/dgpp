@@ -18,7 +18,7 @@ From a source checkout, run:
 
 The wizard requires Python 3.10+ and uses only its standard library. It offers
 the shipped deployment templates by node count, asks for SSH/control addresses,
-SSH login, checkpoint and resident-cache directories and HTTP port, and saves
+SSH login, checkpoint and resident-cache directories, HTTP bind address and port, and saves
 the selected deployment in `DGPP_CLUSTER_CONFIG` in `.env`.
 The addresses can be management IPs, fabric IPs, or a mixture. A separate
 management network is optional: rank 0 can have a separate management IP while
@@ -55,13 +55,15 @@ credentials are preserved but are never loaded or copied to peers by setup.
 No service starts unless you pass `--start`. Setup prints complete `up`, `status`
 and `down` commands, including a custom site-file path when used. The final
 preflight checks software-visible readiness; startup still validates memory
-capacity and actually establishes the fabric. Keep HTTP on localhost unless
-you have arranged an authenticated proxy or tunnel.
+capacity and actually establishes the fabric. HTTP defaults to all IPv4
+interfaces (`0.0.0.0`); choose `127.0.0.1` in the bind-address prompt for
+local-only access, or a local LAN address for a single interface. Unattended
+setup accepts the same setting with `--http-bind ADDRESS`.
 
 Rerun the same command after fixing a failure: setup preserves existing local
 deployment JSONs, unrelated `.env` content and completed downloads/build work.
-It updates only selected site settings. An existing deployment's `http.port`
-takes precedence over the site default and must be edited in that deployment.
+It updates only selected site settings. An existing deployment's `http.bind_host`
+and `http.port` take precedence over site defaults and must be edited in that deployment.
 Exported site variables still take precedence; setup asks you to unset one if
 it conflicts with a requested change. Use `--env-file FILE` for a separate site
 file. Stop deployments using a checkpoint before updating or syncing it.
@@ -436,9 +438,13 @@ starting ranks. Add `--local-only` to check rank 0 without SSH. It does not
 prove end-to-end RDMA connectivity; startup checks the model's memory plan.
 
 Wait for `READY`. A cold load takes longer than a resident-cache boot.
-HTTP defaults to `127.0.0.1:18080`. To change it, add or edit the deployment's
+The launcher prints rank 0's log path and a progress update every ten seconds
+while waiting. If rank 0 exits, it shows the exit status and trailing log
+lines immediately instead of waiting for the readiness timeout.
+HTTP defaults to `0.0.0.0:18080` (all IPv4 interfaces). To change it, use the
+setup bind-address prompt, `--http-bind`, or add or edit the deployment's
 `http` object, for example `"http": {"bind_host": "127.0.0.1", "port": 18081}`.
-Keep localhost for now: the server has no TLS or authentication.
+The server has no TLS or authentication; see [networking](networking.md#http-exposure).
 
 ## 8. Send a request, then stop
 
@@ -463,7 +469,8 @@ Keep localhost for now: the server has no TLS or authentication.
    ```
 
 Use the URL printed at startup if you changed the HTTP port or bind address.
-For access from another machine, run
+With the default bind address, another machine can use `http://HEAD_ADDRESS:18080`.
+For a deployment bound to localhost, run
 `ssh -N -L 18080:127.0.0.1:18080 USER@HEAD_ADDRESS` on that machine, then
 use its localhost endpoint. Shared access needs an authenticated TLS proxy;
 see [networking](networking.md).

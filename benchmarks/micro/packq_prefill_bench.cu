@@ -13,6 +13,7 @@
 
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
+#include "kernels/glm_moe_launch.hpp"
 #include "kernels/packq_gemm.hpp"
 #include "kernels/packq_gemv.hpp"
 
@@ -54,14 +55,14 @@ void run(int m, int n, int k, int bits, int experts, int top_k, int iters, bool 
          bool same_weights, bool shuffle_rows, bool device_copy, bool pair) {
   using namespace dgpp;
   std::mt19937 rng(0x6144512);
-  const int group = sf == 0 ? 64 : 128;
+  const int group = dgpp::packed_scale_group(sf);
   const size_t words = static_cast<size_t>(n) * k * bits / 32;
   const size_t factors = static_cast<size_t>(n) * k / group;
   Buffer<uint32_t> packed(words * experts);
   Buffer<uint16_t> scales(factors * experts);
   for (size_t i = 0; i < words * experts; ++i) packed.p[i] = rng();
   for (size_t i = 0; i < factors * experts; ++i)
-    scales.p[i] = sf == 0 ? float_to_bf16_bits(0.0001f + (rng() % 1000) * 0.000003f)
+    scales.p[i] = sf != dgpp::kPackedScaleF16G128 ? float_to_bf16_bits(0.0001f + (rng() % 1000) * 0.000003f)
                           : float_to_fp16_bits(0.0001f + (rng() % 1000) * 0.000003f);
   Buffer<MoeExpertView> views(experts * 3);
   Buffer<MoeSegment> segs(experts);
@@ -117,6 +118,17 @@ void run(int m, int n, int k, int bits, int experts, int top_k, int iters, bool 
     a.p[i] = float_to_bf16_bits((int(rng() % 2001) - 1000) * 0.001f);
   Buffer<int32_t> act_rows(static_cast<size_t>(std::max(rows, 1)));
   Buffer<uint16_t> a_gathered(gather ? static_cast<size_t>(rows) * k : 1);
+  // The Mixed346 form (--sf 3): the rows' int8 codes and fp32 scales per 128
+  // (the quantizer's output form), gathered like the bf16 rows.
+  const bool m346 = sf == dgpp::kPackedScaleBf16G128Mixed346;
+  Buffer<int8_t> aq(m346 ? a_rows * k : 1);
+  Buffer<float> as(m346 ? a_rows * (k / 128) : 1);
+  Buffer<int8_t> aq_gathered(m346 && gather ? static_cast<size_t>(rows) * k : 1);
+  Buffer<float> as_gathered(m346 && gather ? static_cast<size_t>(rows) * (k / 128) : 1);
+  if (m346) {
+    for (size_t i = 0; i < a_rows * k; ++i) aq.p[i] = static_cast<int8_t>(int(rng() % 256) - 128);
+    for (size_t i = 0; i < a_rows * (k / 128); ++i) as.p[i] = 0.002f + (rng() % 1000) * 0.00002f;
+  }
   if (gather) {
     // Segment order: expert-major, tokens ascending within an expert (the
     // segmentation kernel's order).
@@ -147,8 +159,13 @@ void run(int m, int n, int k, int bits, int experts, int top_k, int iters, bool 
         const int r0 = segs.p[e].row0, cnt = segs.p[e].rows;
         for (int i = cnt - 1; i > 0; --i) std::swap(act_rows.p[r0 + i], act_rows.p[r0 + static_cast<int>(rng2() % (i + 1))]);
       }
-    for (int r = 0; r < rows; ++r)
+    for (int r = 0; r < rows; ++r) {
       std::memcpy(a_gathered.p + static_cast<size_t>(r) * k, a.p + static_cast<size_t>(act_rows.p[r]) * k, k * 2);
+      if (m346) {
+        std::memcpy(aq_gathered.p + static_cast<size_t>(r) * k, aq.p + static_cast<size_t>(act_rows.p[r]) * k, k);
+        std::memcpy(as_gathered.p + static_cast<size_t>(r) * (k / 128), as.p + static_cast<size_t>(act_rows.p[r]) * (k / 128), (k / 128) * 4);
+      }
+    }
   }
   Buffer<Out> baseline(static_cast<size_t>(rows) * n), candidate(static_cast<size_t>(rows) * n);
   // --device-copy 1: the timed launches read cudaMalloc copies of the
@@ -167,6 +184,8 @@ void run(int m, int n, int k, int bits, int experts, int top_k, int iters, bool 
   const uint16_t* scales_p = scales.p;
   const uint16_t* a_p = a.p;
   const int32_t* act_rows_p = act_rows.p;
+  const int8_t* aq_p = aq.p;
+  const float* as_p = as.p;
   MoeSegment* segs_p = segs.p;
   MoeExpertView* views_p = views.p;
   if (device_copy) {
@@ -177,6 +196,10 @@ void run(int m, int n, int k, int bits, int experts, int top_k, int iters, bool 
     packed_p = static_cast<const uint32_t*>(copy(packed.p, words * experts * 4));
     scales_p = static_cast<const uint16_t*>(copy(scales.p, factors * experts * 2));
     a_p = static_cast<const uint16_t*>(copy(a.p, a_rows * k * 2));
+    if (m346) {
+      aq_p = static_cast<const int8_t*>(copy(aq.p, a_rows * k));
+      as_p = static_cast<const float*>(copy(as.p, a_rows * (k / 128) * 4));
+    }
     act_rows_p = static_cast<const int32_t*>(copy(act_rows.p, static_cast<size_t>(std::max(rows, 1)) * 4));
     segs_p = static_cast<MoeSegment*>(copy(segs.p, static_cast<size_t>(experts) * sizeof(MoeSegment)));
     for (int e = 0; e < experts; ++e) {
@@ -208,6 +231,7 @@ void run(int m, int n, int k, int bits, int experts, int top_k, int iters, bool 
     Out* out = mma ? candidate.p : baseline.p;
     const bool tc = mma || baseline_mode == "mma0";
     const int var = mma ? variant : 0;
+    if (experts == 1 && m346) throw std::runtime_error("--sf 3 takes --experts > 1 (the grouped launchers)");
     if (experts == 1) {
       if constexpr (std::is_same_v<Out, float>) {
         if (tc) launch_packq_gemm_f32_variant(a_p, k, dense, out, m, n, k, nullptr, var);
@@ -217,19 +241,35 @@ void run(int m, int n, int k, int bits, int experts, int top_k, int iters, bool 
         else launch_packq_gemv_bf16(a_p, k, dense, out, m, n, k, nullptr);
       }
     } else if constexpr (std::is_same_v<Out, float>) {
-      if (tc)
+      if (tc && m346)
+        launch_moe_grouped_mma_packq_f32(a_p, k, segs_p, experts, m, views_p, 0, out, n, n, k, bits, nullptr,
+                                         gather ? act_rows_p : nullptr, sf, var, mma && listed ? tiles.p : nullptr,
+                                         tile_count.p, tile_cap, aq_p, k, as_p, k / 128);
+      else if (tc)
         launch_moe_grouped_mma_packq_f32(a_p, k, segs_p, experts, m, views_p, 0, out, n, n, k, bits,
                                          nullptr, gather ? act_rows_p : nullptr, sf, var,
                                          mma && listed ? tiles.p : nullptr, tile_count.p, tile_cap);
+      else if (m346)
+        launch_moe_grouped_gemv_m346_f32(gather ? a_gathered.p : a_p, k, gather ? aq_gathered.p : aq_p, k,
+                                         gather ? as_gathered.p : as_p, k / 128, segs_p, experts, m, 0, views_p, 0,
+                                         out, n, n, k, nullptr);
       else
         launch_moe_grouped_gemv_packq_f32(gather ? a_gathered.p : a_p, k, segs_p, experts, m, 0, views_p, 0,
                                           out, n, n, k, bits, nullptr, sf);
     } else {
-      if (tc)
+      if (tc && m346)
+        launch_moe_grouped_mma_packq_bf16(a_p, k, segs_p, experts, m, views_p, 0, out, n, n, k, bits, nullptr,
+                                          gather ? act_rows_p : nullptr, sf, var, mma && listed ? tiles.p : nullptr,
+                                          tile_count.p, tile_cap, nullptr, -1, aq_p, k, as_p, k / 128);
+      else if (tc)
         launch_moe_grouped_mma_packq_bf16(a_p, k, segs_p, experts, m, views_p, 0, out, n, n, k,
                                           bits, nullptr, gather ? act_rows_p : nullptr, sf, var,
                                           mma && listed ? tiles.p : nullptr, tile_count.p, tile_cap,
                                           mma && pair ? pair_out.p : nullptr, 0);
+      else if (m346)
+        launch_moe_grouped_gemv_m346_bf16(gather ? a_gathered.p : a_p, k, gather ? aq_gathered.p : aq_p, k,
+                                          gather ? as_gathered.p : as_p, k / 128, segs_p, experts, m, 0, views_p, 0,
+                                          out, n, n, k, nullptr);
       else
         launch_moe_grouped_gemv_packq_bf16(gather ? a_gathered.p : a_p, k, segs_p, experts, m, 0, views_p, 0,
                                            out, n, n, k, bits, nullptr, sf);
@@ -319,7 +359,7 @@ int main(int argc, char** argv) try {
     else
       throw std::invalid_argument("unknown option: " + key);
   }
-  if (m <= 0 || n <= 0 || k <= 0 || k % 64 || (bits != 4 && bits != 8) || experts < top_k ||
+  if (m <= 0 || n <= 0 || k <= 0 || k % 64 || !dgpp::packed_bits_allowed(sf, bits) || experts < top_k ||
       top_k <= 0 || iters <= 0 || (distribution != "uniform" && distribution != "hot" && distribution != "zipf") ||
       (output != "bf16" && output != "f32"))
     throw std::invalid_argument("invalid shape or options");

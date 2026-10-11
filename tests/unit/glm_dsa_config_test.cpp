@@ -187,3 +187,226 @@ DGPP_TEST(glm_dsa_config_reads_the_landed_checkpoint) {
     return;
   }
 }
+
+// --- the NF4I8 contract (2026-10-08) -------------------------------------------
+
+DGPP_TEST(glm_dsa_config_parses_the_nf4i8_release) {
+  using glm_dsa_test::config_json_nf4i8;
+  const dgpp::GlmDsaTextConfig c = parse(config_json_nf4i8());
+  require(c.hidden_size == 6144 && c.num_hidden_layers == 78 && c.mtp_layer() == 78, "shape");
+  // The same packed shape as the baseline it was built from ...
+  require(c.packed_layer_begin == 3 && c.packed_layer_end == 78, "packed range");
+  require(c.attention_bits == 8 && c.shared_bits == 8 && c.expert_bits == 4, "widths");
+  require(c.packed_group_size == 64, "the retained int8 triples' group");
+  // ... with the routed experts in the codebook format, rotated inputs.
+  require(c.expert_scale_fmt == dgpp::kPackedScaleBf16G128Nf4i8, "expert scale format");
+  require(c.expert_group_size() == 128, "expert group");
+  require(c.expert_input_hadamard32, "H32 rotation");
+  require(c.expert_scale_fmt_of(3) == dgpp::kPackedScaleBf16G128Nf4i8 && c.expert_scale_fmt_of(77) == dgpp::kPackedScaleBf16G128Nf4i8,
+          "main layers carry the codebook");
+  require(c.expert_scale_fmt_of(2) == dgpp::kPackedScaleBf16G64 && c.expert_scale_fmt_of(78) == dgpp::kPackedScaleBf16G64,
+          "the dense layers and the draft do not");
+  require(c.expert_input_hadamard32_of(3) && c.expert_input_hadamard32_of(77) && !c.expert_input_hadamard32_of(78) &&
+              !c.expert_input_hadamard32_of(2),
+          "the rotation follows the packed range");
+  require(c.expert_bits_of(3) == 4 && c.expert_bits_of(78) == 0 && c.attention_bits_of(50) == 8, "bits by layer");
+  // The baseline's config still parses to the plain form.
+  const dgpp::GlmDsaTextConfig b = parse(config_json());
+  require(b.expert_scale_fmt == dgpp::kPackedScaleBf16G64 && !b.expert_input_hadamard32 && b.expert_group_size() == 64,
+          "the compressed-tensors release is unrotated group 64");
+}
+
+DGPP_TEST(glm_dsa_config_refuses_nf4i8_contract_drift) {
+  using glm_dsa_test::config_json_nf4i8;
+  // The format identity.
+  require(has(refusal(config_json_nf4i8("\"quant_method\": \"dgpp_nf4i8\"", "\"quant_method\": \"dgpp_nf4i7\"")), "quant_method"),
+          "unknown method");
+  require(has(refusal(config_json_nf4i8("\"format_version\": 1", "\"format_version\": 2")), "format_version"), "version 2");
+  require(has(refusal(config_json_nf4i8("\"format\": \"mixed-codebook-packed\"", "\"format\": \"pack-quantized\"")), "format"),
+          "format name");
+  // The codebook must be the compiled one, level for level.
+  require(has(refusal(config_json_nf4i8("-127, -88, -67", "-127, -89, -67")), "codebook"), "codebook level");
+  require(has(refusal(config_json_nf4i8("92, 127]", "92]")), "codebook"), "codebook length");
+  // The routed geometry.
+  require(has(refusal(config_json_nf4i8("\"bits\": 4", "\"bits\": 3")), "routed_experts.bits"), "3 bits");
+  require(has(refusal(config_json_nf4i8("\"group_size\": 128", "\"group_size\": 64")), "routed_experts.group_size"), "routed group");
+  require(has(refusal(config_json_nf4i8("\"indices_dtype\": \"int32\"", "\"indices_dtype\": \"uint8\"")), "indices_dtype"), "indices dtype");
+  require(has(refusal(config_json_nf4i8("\"indices_key\": \"weight_indices\"", "\"indices_key\": \"weight_packed\"")), "indices_key"),
+          "indices key");
+  require(has(refusal(config_json_nf4i8("low nibble first\",\n      \"scale_dtype\": \"bfloat16\"",
+                                        "low nibble first\",\n      \"scale_dtype\": \"float16\"")),
+              "routed_experts.scale_dtype"), "routed scale dtype");
+  require(has(refusal(config_json_nf4i8("low byte first\",\n      \"scale_dtype\": \"bfloat16\"",
+                                        "low byte first\",\n      \"scale_dtype\": \"float16\"")),
+              "retained_int8.scale_dtype"), "retained scale dtype");
+  // The retained triples.
+  require(has(refusal(config_json_nf4i8("\"group_size\": 64,\n      \"layers\"", "\"group_size\": 128,\n      \"layers\"")),
+              "retained_int8.group_size"), "retained group");
+  require(has(refusal(config_json_nf4i8("\"layers\": [3, 77],\n      \"modules\"", "\"layers\": [3, 76],\n      \"modules\"")),
+              "layers"), "ranges differ");
+  require(has(refusal(config_json_nf4i8("\"layers\": [3, 77],\n      \"packing\": \"8", "\"layers\": [2, 77],\n      \"packing\": \"8")),
+              "layers"), "a packed dense layer");
+  // The input transform.
+  require(has(refusal(config_json_nf4i8("\"type\": \"normalized_hadamard\"", "\"type\": \"hadamard\"")), "input_transform.type"),
+          "transform type");
+  require(has(refusal(config_json_nf4i8("\"block_size\": 32", "\"block_size\": 64")), "input_transform.block_size"), "block 64");
+  require(has(refusal(config_json_nf4i8("\"axis\": \"input_channels\"", "\"axis\": \"output_channels\"")), "input_transform.axis"),
+          "transform axis");
+  require(has(refusal(config_json_nf4i8("[\"gate_proj\", \"up_proj\", \"down_proj\"]", "[\"gate_proj\", \"up_proj\"]")),
+              "apply_to"), "down not rotated");
+  require(has(refusal(config_json_nf4i8("[\"gate_proj\", \"up_proj\", \"down_proj\"]", "[\"gate_proj\", \"up_proj\", \"down_proj\", \"o_proj\"]")),
+              "apply_to"), "an unknown projection");
+  {
+    std::string s = config_json_nf4i8();
+    const std::string anchor = "      \"input_transform\": {";
+    const size_t at = s.find(anchor);
+    require(at != std::string::npos, "transform anchor");
+    const size_t end = s.find("      },\n", at);
+    s.erase(at, end + 9 - at);
+    require(has(refusal(s), "input_transform"), "a missing transform");
+  }
+  // The compressed-tensors branch does not read the NF4I8 keys, and vice
+  // versa: an NF4I8 block under the other method is refused by name.
+  require(has(refusal(config_json_nf4i8("\"quant_method\": \"dgpp_nf4i8\"", "\"quant_method\": \"compressed-tensors\"")), "format"),
+          "nf4i8 block under compressed-tensors");
+  require(has(refusal(config_json("\"quant_method\": \"compressed-tensors\"", "\"quant_method\": \"dgpp_nf4i8\"")), "format"),
+          "compressed-tensors block under dgpp_nf4i8");
+}
+
+DGPP_TEST(glm_dsa_config_parses_the_mixed346_release) {
+  using glm_dsa_test::config_json_mixed346;
+  const dgpp::GlmDsaTextConfig c = parse(config_json_mixed346());
+  // The baseline's packed shape (the attention and shared-expert triples,
+  // the existing experts and the draft's requant width) ...
+  require(c.packed_layer_begin == 3 && c.packed_layer_end == 78, "packed range");
+  require(c.attention_bits == 8 && c.shared_bits == 8 && c.expert_bits == 4 && c.packed_group_size == 64, "baseline widths");
+  // ... the routed experts in the Mixed346 format: rotated int8 activations,
+  // one form per expert from the recipe.
+  require(c.expert_mixed346() && c.expert_scale_fmt == dgpp::kPackedScaleBf16G128Mixed346 && c.expert_group_size() == 128,
+          "expert format");
+  require(c.expert_input_hadamard32 && c.expert_activation_bits == 8, "rotation and int8 activations");
+  require(c.expert_activation_bits_of(3) == 8 && c.expert_activation_bits_of(77) == 8 && c.expert_activation_bits_of(2) == 0 &&
+              c.expert_activation_bits_of(78) == 0,
+          "activation codes follow the packed range");
+  require(c.expert_recipe.size() == 78u * 256u, "the recipe table");
+  // Layer 3 expert e is kMixed346Forms[(3 + e) % 8]: 333, 666, 443, 336, existing, 444, 334, 446.
+  require(c.expert_proj_bits_of(3, 0, 0) == 3 && c.expert_proj_bits_of(3, 0, 1) == 3 && c.expert_proj_bits_of(3, 0, 2) == 3, "333");
+  require(c.expert_proj_bits_of(3, 1, 0) == 6 && c.expert_proj_bits_of(3, 1, 1) == 6 && c.expert_proj_bits_of(3, 1, 2) == 6, "666");
+  require(c.expert_proj_bits_of(3, 2, 0) == 4 && c.expert_proj_bits_of(3, 2, 2) == 3, "443");
+  require(c.expert_proj_bits_of(3, 3, 0) == 3 && c.expert_proj_bits_of(3, 3, 2) == 6, "336");
+  require(c.expert_proj_bits_of(3, 5, 0) == 4 && c.expert_proj_bits_of(3, 5, 2) == 4, "444");
+  require(c.expert_proj_bits_of(3, 6, 0) == 3 && c.expert_proj_bits_of(3, 6, 2) == 4, "334");
+  require(c.expert_proj_bits_of(3, 7, 0) == 4 && c.expert_proj_bits_of(3, 7, 2) == 6, "446");
+  for (int e : {0, 1, 2, 3, 5, 6, 7})
+    require(c.expert_scale_fmt_of(3, e) == dgpp::kPackedScaleBf16G128Mixed346, "a converted expert's format");
+  require(c.expert_recipe_of(3, 4) == dgpp::GlmDsaTextConfig::kExpertRecipeExisting &&
+              c.expert_scale_fmt_of(3, 4) == dgpp::kPackedScaleBf16G64 && c.expert_proj_bits_of(3, 4, 0) == 4 &&
+              c.expert_proj_bits_of(3, 4, 2) == 4,
+          "an existing expert keeps the baseline triple");
+  require(c.expert_scale_fmt_of(78, 0) == dgpp::kPackedScaleBf16G64 && c.expert_proj_bits_of(78, 0, 0) == 0 &&
+              c.expert_recipe_of(78, 0) == 0,
+          "the draft is BF16, requantized at the baseline width");
+  require(c.expert_scale_fmt_of(2, 0) == dgpp::kPackedScaleBf16G64 && c.expert_recipe_of(2, 0) == 0, "a dense layer");
+  // The uniform accessors name the layer's nominal form.
+  require(c.expert_scale_fmt_of(3) == dgpp::kPackedScaleBf16G128Mixed346 && c.expert_scale_fmt_of(78) == dgpp::kPackedScaleBf16G64 &&
+              c.expert_input_hadamard32_of(77) && !c.expert_input_hadamard32_of(78),
+          "layer-level form");
+}
+
+DGPP_TEST(glm_dsa_config_refuses_mixed346_contract_drift) {
+  using glm_dsa_test::config_json_mixed346;
+  require(has(refusal(config_json_mixed346("\"quant_method\": \"dgpp_mixed346\"", "\"quant_method\": \"dgpp_mixed347\"")),
+              "quant_method"),
+          "method");
+  require(has(refusal(config_json_mixed346("\"format\": \"dgpp_mixed346_h32_a8_g128_v1\",\n    \"group_size\": 128,\n    \"quant_method\"",
+                                           "\"format\": \"dgpp_mixed346_h32_a8_g128_v2\",\n    \"group_size\": 128,\n    \"quant_method\"")),
+              "quantization_config.format"),
+          "format v2");
+  require(has(refusal(config_json_mixed346("\"activation_bits\": 8,", "\"activation_bits\": 16,")), "activation_bits"), "A16");
+  require(has(refusal(config_json_mixed346("\"group_size\": 128,\n    \"quant_method\"", "\"group_size\": 64,\n    \"quant_method\"")),
+              "quantization_config.group_size"),
+          "group 64");
+  require(has(refusal(config_json_mixed346("\"rotation_size\": 32,\n    \"version\": 1,\n    \"baseline\"",
+                                           "\"rotation_size\": 64,\n    \"version\": 1,\n    \"baseline\"")),
+              "rotation_size"),
+          "rotation 64");
+  // The baseline block is the compressed-tensors contract and is parsed as
+  // such: its own refusals come through by name.
+  require(has(refusal(config_json_mixed346("\"quant_method\": \"compressed-tensors\"", "\"quant_method\": \"gptq\"")),
+              "baseline.quant_method"),
+          "baseline method");
+  require(has(refusal(config_json_mixed346("\"num_bits\": 4, \"observer\"", "\"num_bits\": 3, \"observer\"")), "num_bits"),
+          "baseline width");
+  // The recipe: codebooks, the activation policy, the forms, the counts.
+  require(has(refusal(config_json_mixed346("-79.0, -45.0", "-80.0, -45.0")), "weight_codebooks.3"), "3-bit codebook");
+  require(has(refusal(config_json_mixed346("-127, -88, -67", "-127, -89, -67")), "weight_codebooks.4"), "4-bit codebook");
+  require(has(refusal(config_json_mixed346("-32, -31, -30", "-32, -31, -29")), "weight_codebooks.6"), "6-bit codebook");
+  require(has(refusal(config_json_mixed346("\"rounding\": \"nearest ties-to-even\"", "\"rounding\": \"nearest ties-away\"")),
+              "activation.rounding"),
+          "rounding");
+  require(has(refusal(config_json_mixed346("\"clamp\": [-128, 127]", "\"clamp\": [-127, 127]")), "activation.clamp"), "clamp");
+  require(has(refusal(config_json_mixed346("\"scale\": \"max(amax/127,1e-30)\"", "\"scale\": \"amax/127\"")), "activation.scale"),
+          "scale rule");
+  require(has(refusal(config_json_mixed346("\"3\": {\"0\": \"333\"", "\"3\": {\"0\": \"343\"")), "layer_expert_recipes.3.0"),
+          "gate != up");
+  require(has(refusal(config_json_mixed346("\"3\": {\"0\": \"333\"", "\"3\": {\"0\": \"335\"")), "layer_expert_recipes.3.0"),
+          "a 5-bit width");
+  require(has(refusal(config_json_mixed346("\"3\": {\"0\": \"333\"", "\"3\": {\"0\": \"444\"")), "recipe_counts"),
+          "the counts disagree with the table");
+  require(has(refusal(config_json_mixed346("\"77\": {", "\"78\": {")), "layer_expert_recipes.78"), "a layer past the stack");
+  require(has(refusal(config_json_mixed346("\"3\": {\"0\": \"333\", \"1\": \"666\"", "\"3\": {\"0\": \"333\", \"0\": \"666\"")),
+              "layer_expert_recipes.3.0"),
+          "an expert listed twice");
+}
+
+DGPP_TEST(glm_dsa_config_reads_the_landed_mixed346_checkpoint) {
+  namespace fs = std::filesystem;
+  const char* home = std::getenv("HOME");
+  if (!home) return;
+  const fs::path root =
+      fs::path(home) / ".cache/huggingface/hub/models--HawkBearPig--GLM-5.3-Mixed346-GPTQ-H32-A8-g128/snapshots";
+  if (!fs::is_directory(root)) return;
+  for (const auto& snap : fs::directory_iterator(root)) {
+    const fs::path cfg = snap.path() / "config.json";
+    if (!fs::exists(cfg) || !fs::exists(snap.path() / "quantization-recipe.json") ||
+        !fs::exists(snap.path() / "baseline-quantization-config.json"))
+      continue;
+    require(dgpp::detect_architecture_file(cfg.string()) == dgpp::ModelArchitecture::GlmMoeDsa, "arch");
+    const dgpp::GlmDsaTextConfig c = dgpp::GlmDsaTextConfig::from_json_file(cfg.string());
+    require(c.num_hidden_layers == 78 && c.mtp_layer() == 78 && c.n_routed_experts == 256, "landed values");
+    require(c.num_indexer_layers() == 21 && c.packed_layer_begin == 3 && c.packed_layer_end == 78, "landed shape");
+    require(c.attention_bits == 8 && c.expert_bits == 4 && c.shared_bits == 8, "landed widths");
+    require(c.expert_mixed346() && c.expert_input_hadamard32 && c.expert_activation_bits == 8, "landed format");
+    // The card's census: 116 existing experts, 15,672 of 444, 74 of 666.
+    size_t existing = 0, f444 = 0, f666 = 0;
+    for (int l = 3; l < 78; ++l)
+      for (int e = 0; e < 256; ++e) {
+        const uint8_t r = c.expert_recipe_of(l, e);
+        existing += r == dgpp::GlmDsaTextConfig::kExpertRecipeExisting;
+        f444 += r == 0x44;
+        f666 += r == 0x66;
+      }
+    require(existing == 116 && f444 == 15672 && f666 == 74, "the card's census");
+    return;
+  }
+}
+
+DGPP_TEST(glm_dsa_config_reads_the_landed_nf4i8_checkpoint) {
+  namespace fs = std::filesystem;
+  const char* home = std::getenv("HOME");
+  if (!home) return;
+  const fs::path root =
+      fs::path(home) / ".cache/huggingface/hub/models--HawkBearPig--GLM-5.3-NF4I8-GPTQ-H32-g128/snapshots";
+  if (!fs::is_directory(root)) return;
+  for (const auto& snap : fs::directory_iterator(root)) {
+    const fs::path cfg = snap.path() / "config.json";
+    if (!fs::exists(cfg)) continue;
+    require(dgpp::detect_architecture_file(cfg.string()) == dgpp::ModelArchitecture::GlmMoeDsa, "arch");
+    const dgpp::GlmDsaTextConfig c = dgpp::GlmDsaTextConfig::from_json_file(cfg.string());
+    require(c.num_hidden_layers == 78 && c.mtp_layer() == 78 && c.n_routed_experts == 256, "landed values");
+    require(c.num_indexer_layers() == 21 && c.packed_layer_begin == 3 && c.packed_layer_end == 78, "landed shape");
+    require(c.attention_bits == 8 && c.expert_bits == 4 && c.shared_bits == 8, "landed widths");
+    require(c.expert_scale_fmt == dgpp::kPackedScaleBf16G128Nf4i8 && c.expert_input_hadamard32, "landed format");
+    return;
+  }
+}

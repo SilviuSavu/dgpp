@@ -29,6 +29,7 @@ pipeline that rounds at other points.
       --engine-dump states.bin [--device cuda] [--dtype float32]
 """
 import argparse
+import math
 import json
 import os
 import sys
@@ -52,19 +53,46 @@ class Shards:
     def has(self, name):
         return name in self.index
 
-    def linear(self, prefix):
-        """A Linear's weight as float32: BF16 verbatim or the packed triple dequantized."""
-        if self.has(prefix + ".weight_packed"):
-            words = self.get(prefix + ".weight_packed")          # int32 [N, K*bits/32]
-            scales = self.get(prefix + ".weight_scale").float()   # [N, K/64]
+    # The NF4I8 contract (src/models/glm_dsa/config.cpp): `weight_indices`
+    # nibbles select a level of the fixed codebook, one bf16 scale per 128;
+    # the routed experts were quantized in the H32-rotated input basis.
+    NF4I8_CODEBOOK = torch.tensor([-127, -88, -67, -50, -36, -23, -12, 0, 10, 20, 31, 43, 56, 71, 92, 127],
+                                  dtype=torch.float32)
+
+    @staticmethod
+    def hadamard32():
+        """The normalized 32-wide Sylvester Hadamard (symmetric, its own inverse)."""
+        h = torch.ones(1, 1, dtype=torch.float32)
+        while h.shape[0] < 32:
+            h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
+        return h / math.sqrt(32.0)
+
+    def linear(self, prefix, fold_h32=False):
+        """A Linear's weight as float32: BF16 verbatim or the packed triple
+        dequantized. `fold_h32` (a routed expert of the NF4I8 checkpoint):
+        the stored matrix W' acts on H32-rotated inputs, so W' . H32 is the
+        weight on the plain input (H32 symmetric and orthonormal; the engine
+        rotates the activation in bf16 instead — a bf16 rounding apart)."""
+        if self.has(prefix + ".weight_packed") or self.has(prefix + ".weight_indices"):
+            codebook = self.has(prefix + ".weight_indices")
+            words = self.get(prefix + (".weight_indices" if codebook else ".weight_packed"))  # int32 [N, K*bits/32]
+            scales = self.get(prefix + ".weight_scale").float()   # [N, K/group]
             shape = self.get(prefix + ".weight_shape").tolist()   # [N, K]
             n, k = int(shape[0]), int(shape[1])
             bits = words.shape[1] * 32 // k
             per = 32 // bits
+            group = 128 if codebook else 64
             u = words.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
             codes = torch.stack([(u >> (bits * j)) & ((1 << bits) - 1) for j in range(per)], dim=-1).reshape(n, k)
-            codes = codes.to(torch.float32) - float(1 << (bits - 1))
-            return codes * scales.repeat_interleave(64, dim=1)
+            if codebook:
+                levels = self.NF4I8_CODEBOOK[codes]
+            else:
+                levels = codes.to(torch.float32) - float(1 << (bits - 1))
+            w = levels * scales.repeat_interleave(group, dim=1)
+            if fold_h32:
+                h = self.hadamard32()
+                w = (w.reshape(n, k // 32, 32) @ h).reshape(n, k)
+            return w
         return self.get(prefix + ".weight").to(torch.float32)
 
 
@@ -80,6 +108,14 @@ def main():
     from transformers import AutoConfig
     from transformers.models.glm_moe_dsa import modeling_glm_moe_dsa as mg
     cfg = AutoConfig.from_pretrained(args.checkpoint_dir)
+    # The NF4I8 contract's rotated routed range (the fold in Shards.linear).
+    qc = getattr(cfg, "quantization_config", None) or {}
+    h32_layers = None
+    if isinstance(qc, dict) and qc.get("quant_method") == "dgpp_nf4i8":
+        t = qc["routed_experts"].get("input_transform") or {}
+        if t.get("type") != "normalized_hadamard" or t.get("block_size") != 32:
+            raise SystemExit("dgpp_nf4i8: the reference implements the 32-wide normalized Hadamard rotation")
+        h32_layers = (int(qc["routed_experts"]["layers"][0]), int(qc["routed_experts"]["layers"][1]))
     cfg.num_hidden_layers = args.layers
     for k in ("indexer_types", "layer_types", "mlp_layer_types"):
         if getattr(cfg, k, None) is not None:
@@ -119,10 +155,11 @@ def main():
         if q + "mlp.experts.gate_up_proj" in sd:
             gu = torch.empty(sd[q + "mlp.experts.gate_up_proj"].shape, dtype=sd[q + "mlp.experts.gate_up_proj"].dtype)
             dn = torch.empty(sd[q + "mlp.experts.down_proj"].shape, dtype=sd[q + "mlp.experts.down_proj"].dtype)
+            fold = h32_layers is not None and h32_layers[0] <= l <= h32_layers[1]
             for e in range(E):
-                g = sh.linear(p + f"mlp.experts.{e}.gate_proj").to(gu.dtype)
-                u = sh.linear(p + f"mlp.experts.{e}.up_proj").to(gu.dtype)
-                d = sh.linear(p + f"mlp.experts.{e}.down_proj").to(dn.dtype)
+                g = sh.linear(p + f"mlp.experts.{e}.gate_proj", fold).to(gu.dtype)
+                u = sh.linear(p + f"mlp.experts.{e}.up_proj", fold).to(gu.dtype)
+                d = sh.linear(p + f"mlp.experts.{e}.down_proj", fold).to(dn.dtype)
                 if gu.shape[1] == g.shape[0] + u.shape[0]:      # [E, 2I, H]
                     gu[e, : g.shape[0]] = g
                     gu[e, g.shape[0]:] = u
@@ -135,7 +172,7 @@ def main():
         else:
             for e in range(E):
                 for m in ("gate_proj", "up_proj", "down_proj"):
-                    new[q + f"mlp.experts.{e}.{m}.weight"] = sh.linear(p + f"mlp.experts.{e}.{m}").to(dtype)
+                    new[q + f"mlp.experts.{e}.{m}.weight"] = sh.linear(p + f"mlp.experts.{e}.{m}", fold).to(dtype)
         print(f"layer {l} experts loaded", file=sys.stderr)
     missing = [k for k in sd if k not in new]
     extra = [k for k in new if k not in sd]

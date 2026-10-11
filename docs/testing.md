@@ -35,6 +35,13 @@ history, invalid field types and role restrictions. The UTF-8 case keeps
 heap-backed reasoning alive through later messages and template preparation;
 run these cases under the `asan` preset to check the owned-string lifetime.
 
+`DGPP_TEST_FILTER=serve_timings_ build-ci/serve_test` covers completion timing
+compatibility: cached prompts on both endpoints, queue exclusion with unchanged
+TTFT/prefill/TPOT histograms, resumed prefill, streaming with usage omitted,
+false or true, multiple choices exceeding available slots, single-token
+completions and speculative batches. It also checks that existing usage, JSON
+metrics and Prometheus token counters keep their definitions.
+
 Release and testing builds use separate CMake presets and directories:
 
 | Preset | Directory | Purpose |

@@ -2381,6 +2381,14 @@ iteration must not influence collective order.
 
 ### Text API
 
+Completion response `timings` are a separate compatibility view over the
+service's request timestamps and token counts. Their prompt rates exclude
+cached tokens and initial admission queue time; decode rates exclude prefill
+picks. The view preserves the existing usage, scheduler meters, Prometheus
+histograms and throughput logs. Final stream events carry timings even when
+usage is disabled; see the
+[response contract](docs/openai-compatibility.md#completion-timings-dgpp-extension).
+
 `src/serve/generation_service.*` and `http_server.*` implement:
 
 | route | behavior |

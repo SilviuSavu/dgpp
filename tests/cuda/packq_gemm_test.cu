@@ -5,13 +5,16 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 #include <vector>
 
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
 #include "common/test.hpp"
 #include "kernels/packq_gemm.hpp"
+#include "kernels/packq_a8_gemv.hpp"
 #include "kernels/packq_gemv.hpp"
+#include "loaders/packq_quant.hpp"
 #include "scale_gemm_test_helpers.hpp"
 
 namespace {
@@ -41,8 +44,8 @@ struct Matrix {
     for (size_t i = 0; i < static_cast<size_t>(n) * k * bits / 32; ++i)
       packed.p[i] = static_cast<uint32_t>(rng.next());
     for (size_t i = 0; i < static_cast<size_t>(n) * k / group(); ++i) {
-      const float v = static_cast<float>(std::exp2(rng.unit() * 4) * 0.0031);
-      scales.p[i] = sf == 0 ? dgpp::float_to_bf16_bits(v) : dgpp::float_to_fp16_bits(v);
+      const float v = static_cast<float>(std::exp2(rng.unit() * 4) * (dgpp::packed_codebook(sf) ? 0.0031 / 16 : 0.0031));
+      scales.p[i] = sf == 1 ? dgpp::float_to_fp16_bits(v) : dgpp::float_to_bf16_bits(v);
     }
     scales.p[0] = 0;  // zero scales must also have exact semantics
   }
@@ -51,8 +54,7 @@ struct Matrix {
     const int per = 32 / bits;
     const int g = group();
     const uint32_t w = packed.p[static_cast<size_t>(row) * (k / per) + col / per];
-    const int code =
-        static_cast<int>((w >> (bits * (col % per))) & ((1u << bits) - 1)) - (1 << (bits - 1));
+    const int code = dgpp::packed_code_level((w >> (bits * (col % per))) & ((1u << bits) - 1), bits, sf);
     return code * static_cast<double>(dgpp::packed_scale_to_float(
                       scales.p[static_cast<size_t>(row) * (k / g) + col / g], sf));
   }
@@ -103,7 +105,8 @@ void oracle_check(const Matrix& w, const uint16_t* a, int stride, const float* g
     }
   const double relative = std::sqrt(error2 / std::max(norm2, 1e-30));
   std::printf("int%d%s M%d N%d K%d: fp32 l2_rel %.3g max_error/max_abs %.3g\n", w.bits,
-              w.sf ? " g128/f16" : "", m, w.n, w.k, relative, max_error / std::max(max_abs, 1e-30));
+              w.sf == 1 ? " g128/f16" : w.sf == 2 ? " nf4i8" : "", m, w.n, w.k, relative,
+              max_error / std::max(max_abs, 1e-30));
   require(relative < 5e-6 && max_error < std::max(1e-8, max_abs * 4e-5),
           "packed GEMM differs from exact FP64 oracle");
   if (baseline) {
@@ -121,13 +124,18 @@ void oracle_check(const Matrix& w, const uint16_t* a, int stride, const float* g
 DGPP_TEST(packq_gemm_exact_weights_and_ragged_tiles) {
   // Format 1 (f16 per 128) at the AutoRound hybrid's widths and the small
   // 128-multiples: the tile's scale is the group of its 64-deep step.
+  // Format 2 (the NF4I8 codebook, 4-bit) at the full GLM-5.3 routed
+  // widths and the two test geometries: the tensor core takes the level.
   const std::vector<std::vector<int>> shapes0 = {{1, 1, 64},     {17, 70, 192},  {33, 129, 512},
                                                  {65, 35, 6144}, {32, 67, 2048}, {3, 17, 16384}};
   const std::vector<std::vector<int>> shapes1 = {{1, 1, 128},   {17, 70, 640},   {33, 129, 2560},
                                                  {32, 67, 256}, {65, 35, 1024},  {3, 17, 2560}};
-  for (int sf : {0, 1})
+  const std::vector<std::vector<int>> shapes2 = {{1, 1, 128},   {17, 70, 512},   {33, 129, 1024},
+                                                 {32, 67, 256}, {65, 35, 6144},  {3, 17, 2048}};
+  for (int sf : {0, 1, 2})
   for (int bits : {4, 8})
-    for (const auto& shape : sf == 0 ? shapes0 : shapes1) {
+    for (const auto& shape : sf == 0 ? shapes0 : sf == 1 ? shapes1 : shapes2) {
+      if (sf == 2 && bits != 4) continue;
       const int m = shape[0], n = shape[1], k = shape[2];
       Matrix w(bits, n, k, 917 + bits + k, sf);
       const int stride = k + (m % 2 ? 3 : 0);
@@ -152,11 +160,12 @@ DGPP_TEST(packq_gemm_exact_weights_and_ragged_tiles) {
 
 DGPP_TEST(packq_gemm_grouped_maps_padding_and_graph) {
   constexpr int n = 70, os = 77, tokens = 137, ns = 9;
-  for (int sf : {0, 1})
+  for (int sf : {0, 1, 2})
   for (int bits : {4, 8}) {
-    const int k = sf == 0 ? 192 : 640;
+    if (sf == 2 && bits != 4) continue;
+    const int k = sf == 0 ? 192 : sf == 1 ? 640 : 512;
     Matrix w(bits, n, k, 611 + bits, sf);
-    w.scales.p[9 * (k / w.group()) + 1] = sf == 0 ? 0x7fc0 : 0x7e00;
+    w.scales.p[9 * (k / w.group()) + 1] = sf == 1 ? 0x7e00 : 0x7fc0;
     Matrix other(bits, n, k, 975 + bits, sf);
     Buffer<dgpp::MoeExpertView> views(ns * 3);
     Buffer<dgpp::MoeSegment> segs(ns);
@@ -321,6 +330,185 @@ DGPP_TEST(packq_gemm_grouped_maps_padding_and_graph) {
     cudaGraphDestroy(graph);
     cudaStreamDestroy(stream);
   }
+}
+
+// The Mixed346 form (2026-10-09): a grouped launch over views of every
+// width (3 / 4 / 6-bit converted triples) and an existing int4 g64 triple,
+// the rows' int8 codes and fp32 scales through the row map, ragged tiles,
+// both output dtypes, both wide forms (bitwise), the tile list (bitwise),
+// NaN propagation — against the exact oracle (integer group dots scaled in
+// double) and, within fp32 reassociation, the Mixed346 GEMV core.
+DGPP_TEST(packq_gemm_mixed346_grouped_matches_oracle) {
+  constexpr int n = 70, os = 77, tokens = 137, ns = 8, k = 512, groups = k / 128;
+  struct M346Matrix {
+    int bits, sf;
+    Buffer<uint32_t> packed;
+    Buffer<uint16_t> scales;
+    M346Matrix(int bits_, int sf_, uint64_t seed)
+        : bits(bits_), sf(sf_), packed(static_cast<size_t>(n) * k * bits_ / 32),
+          scales(static_cast<size_t>(n) * k / dgpp::packed_scale_group(sf_)) {
+      scale_gemm_test::Rng rng(seed);
+      for (size_t i = 0; i < static_cast<size_t>(n) * k * bits / 32; ++i) packed.p[i] = static_cast<uint32_t>(rng.next());
+      const double base = sf == dgpp::kPackedScaleBf16G128Mixed346 ? (bits == 6 ? 0.012 : 0.003) : 0.05;
+      for (size_t i = 0; i < static_cast<size_t>(n) * k / dgpp::packed_scale_group(sf); ++i)
+        scales.p[i] = dgpp::float_to_bf16_bits(static_cast<float>(std::exp2(rng.unit() * 3) * base));
+    }
+    dgpp::GlmPackedMatrix view() const { return {packed.p, scales.p, n, k, bits, sf}; }
+    int level(int row, int col) const { return dgpp::packq_level(packed.p, k, bits, row, col, sf); }
+    double scale(int row, int col) const {
+      const int g = dgpp::packed_scale_group(sf);
+      return dgpp::bf16_bits_to_float(scales.p[static_cast<size_t>(row) * (k / g) + col / g]);
+    }
+  };
+  // Expert e's form: 3, 4, 6, existing, 3, 4, 6, existing.
+  M346Matrix w3(3, dgpp::kPackedScaleBf16G128Mixed346, 0x346003), w4(4, dgpp::kPackedScaleBf16G128Mixed346, 0x346004),
+      w6(6, dgpp::kPackedScaleBf16G128Mixed346, 0x346006), w0(4, dgpp::kPackedScaleBf16G64, 0x346000);
+  w3.scales.p[9 * groups + 1] = 0x7fc0;  // a NaN scale: poisons column 9 of the 3-bit experts' rows
+  const M346Matrix* forms[4] = {&w3, &w4, &w6, &w0};
+  Buffer<dgpp::MoeExpertView> views(ns * 3);
+  Buffer<dgpp::MoeSegment> segs(ns);
+  const int counts[ns] = {1, 16, 17, 31, 32, 33, 65, 130};
+  int total = 0;
+  for (int e = 0; e < ns; ++e) {
+    segs.p[e] = {total, counts[e], e};
+    total += counts[e];
+    for (int which = 0; which < 3; ++which) views.p[e * 3 + which] = dgpp::MoeExpertView::of(forms[e % 4]->view());
+  }
+  Buffer<int32_t> rows(total);
+  for (int r = 0; r < total; ++r) rows.p[r] = (r * 19) % tokens;
+  // The rows: bf16 (the existing experts) and the int8 codes + scales (the
+  // converted ones), independent random data.
+  Buffer<uint16_t> a(static_cast<size_t>(tokens) * k);
+  fill(a.p, static_cast<size_t>(tokens) * k, 617);
+  Buffer<int8_t> aq(static_cast<size_t>(tokens) * k);
+  Buffer<float> as(static_cast<size_t>(tokens) * groups);
+  {
+    scale_gemm_test::Rng rng(0xA8);
+    for (size_t i = 0; i < static_cast<size_t>(tokens) * k; ++i) aq.p[i] = static_cast<int8_t>(static_cast<int>(rng.next() % 256) - 128);
+    for (size_t i = 0; i < static_cast<size_t>(tokens) * groups; ++i) as.p[i] = static_cast<float>(std::exp2(rng.unit() * 2) * 0.01);
+  }
+  Buffer<float> out(static_cast<size_t>(total) * os), out4(static_cast<size_t>(total) * os);
+  Buffer<uint16_t> bf(static_cast<size_t>(total) * os);
+  std::fill(out.p, out.p + static_cast<size_t>(total) * os, -12345.f);
+  std::fill(out4.p, out4.p + static_cast<size_t>(total) * os, -12345.f);
+  std::fill(bf.p, bf.p + static_cast<size_t>(total) * os, uint16_t{0x1234});
+  cudaStream_t stream;
+  DGPP_CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+  const int sf3 = dgpp::kPackedScaleBf16G128Mixed346;
+  dgpp::launch_moe_grouped_mma_packq_f32(a.p, k, segs.p, ns, 130, views.p, 1, out.p, os, n, k, 0, stream, rows.p, sf3,
+                                         -1, nullptr, nullptr, 0, aq.p, k, as.p, groups);
+  dgpp::launch_moe_grouped_mma_packq_f32(a.p, k, segs.p, ns, 130, views.p, 1, out4.p, os, n, k, 0, stream, rows.p, sf3,
+                                         4, nullptr, nullptr, 0, aq.p, k, as.p, groups);
+  dgpp::launch_moe_grouped_mma_packq_bf16(a.p, k, segs.p, ns, 130, views.p, 1, bf.p, os, n, k, 0, stream, rows.p, sf3,
+                                          -1, nullptr, nullptr, 0, nullptr, -1, aq.p, k, as.p, groups);
+  // The tile list: bitwise the segment-major launch.
+  const int tile_cap = dgpp::moe_tile_list_capacity(ns, total, dgpp::kPackqGemmWideRows);
+  Buffer<dgpp::MoeTile> tiles(tile_cap);
+  Buffer<int32_t> tile_count(1);
+  Buffer<float> listed(static_cast<size_t>(total) * os);
+  std::fill(listed.p, listed.p + static_cast<size_t>(total) * os, -12345.f);
+  dgpp::launch_moe_tile_list(segs.p, ns, dgpp::kPackqGemmWideRows, tiles.p, tile_count.p, stream);
+  dgpp::launch_moe_grouped_mma_packq_f32(a.p, k, segs.p, ns, /*max_rows=*/1, views.p, 1, listed.p, os, n, k, 0, stream,
+                                         rows.p, sf3, -1, tiles.p, tile_count.p, tile_cap, aq.p, k, as.p, groups);
+  DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+  require(std::memcmp(out4.p, out.p, static_cast<size_t>(total) * os * 4) == 0, "mixed346: the four-warp form bitwise the eight-warp one");
+  require(std::memcmp(listed.p, out.p, static_cast<size_t>(total) * os * 4) == 0, "mixed346: the listed launch bitwise the segment-major one");
+  // The oracle: per gathered row, the exact group dots (converted) or the
+  // bf16 x (code x scale) chain (existing), in double.
+  double error2 = 0, norm2 = 0, max_abs = 0, max_error = 0;
+  int nan_cols = 0;
+  for (int e = 0; e < ns; ++e) {
+    const M346Matrix& w = *forms[e % 4];
+    const bool conv = w.sf == sf3;
+    for (int j = 0; j < counts[e]; ++j) {
+      const int r = segs.p[e].row0 + j, t = rows.p[r];
+      for (int col = 0; col < n; ++col) {
+        double expected = 0;
+        if (conv) {
+          for (int g = 0; g < groups; ++g) {
+            long dot = 0;
+            for (int q = 0; q < 128; ++q)
+              dot += static_cast<long>(w.level(col, g * 128 + q)) * static_cast<long>(aq.p[static_cast<size_t>(t) * k + g * 128 + q]);
+            expected += static_cast<double>(dot) * w.scale(col, g * 128) * as.p[static_cast<size_t>(t) * groups + g];
+          }
+        } else {
+          for (int kk = 0; kk < k; ++kk)
+            expected += dgpp::bf16_bits_to_float(a.p[static_cast<size_t>(t) * k + kk]) * w.level(col, kk) * w.scale(col, kk);
+        }
+        const float actual = out.p[static_cast<size_t>(r) * os + col];
+        const uint16_t actual_bf = bf.p[static_cast<size_t>(r) * os + col];
+        if (std::isnan(expected)) {
+          require(std::isnan(actual) && (actual_bf & 0x7FFF) > 0x7F80, "mixed346: a NaN scale poisons exactly its column");
+          ++nan_cols;
+          continue;
+        }
+        if (!std::isfinite(actual)) {
+          static int reported = 0;
+          if (reported++ < 12)
+            std::printf("  non-finite: expert %d (form %s) row %d (token %d) col %d: got %g expected %g\n", e,
+                        conv ? (w.bits == 3 ? "3-bit" : w.bits == 4 ? "4-bit" : "6-bit") : "existing", j, t, col,
+                        static_cast<double>(actual), expected);
+        }
+        require(std::isfinite(actual), "mixed346: finite output");
+        require(dgpp::float_to_bf16_bits(actual) == actual_bf, "mixed346: bf16(out_f32) == out_bf16");
+        const double err = std::abs(actual - expected);
+        error2 += err * err;
+        norm2 += expected * expected;
+        max_abs = std::max(max_abs, std::abs(expected));
+        max_error = std::max(max_error, err);
+      }
+    }
+  }
+  const double relative = std::sqrt(error2 / std::max(norm2, 1e-30));
+  std::printf("mixed346 grouped M%d N%d K%d: fp32 l2_rel %.3g max_error/max_abs %.3g, NaN columns %d\n", total, n, k, relative,
+              max_error / std::max(max_abs, 1e-30), nan_cols);
+  require(relative < 5e-6 && max_error < std::max(1e-8, max_abs * 4e-5), "mixed346 tile kernel differs from the exact oracle");
+  require(nan_cols == counts[0] + counts[4], "mixed346: the NaN column on every row of the 3-bit experts");
+  // The GEMV core on one converted expert's rows: the same group dots, fp32
+  // reassociation apart.
+  {
+    const int e = 1, m = counts[e];
+    Buffer<int8_t> cq(static_cast<size_t>(m) * k);
+    Buffer<float> cs(static_cast<size_t>(m) * groups);
+    for (int j = 0; j < m; ++j) {
+      const int t = rows.p[segs.p[e].row0 + j];
+      std::memcpy(cq.p + static_cast<size_t>(j) * k, aq.p + static_cast<size_t>(t) * k, k);
+      std::memcpy(cs.p + static_cast<size_t>(j) * groups, as.p + static_cast<size_t>(t) * groups, groups * 4);
+    }
+    Buffer<float> gemv(static_cast<size_t>(m) * n);
+    dgpp::launch_packq_a8_gemv_f32(cq.p, k, cs.p, groups, w4.view(), gemv.p, m, n, k, stream);
+    DGPP_CUDA_OK(cudaStreamSynchronize(stream));
+    double e2 = 0, n2 = 0;
+    for (int j = 0; j < m; ++j)
+      for (int col = 0; col < n; ++col) {
+        const double g = gemv.p[static_cast<size_t>(j) * n + col], t = out.p[static_cast<size_t>(segs.p[e].row0 + j) * os + col];
+        e2 += (g - t) * (g - t);
+        n2 += t * t;
+      }
+    const double rel = std::sqrt(e2 / std::max(n2, 1e-30));
+    std::printf("mixed346 tile vs GEMV core (4-bit expert): l2_rel %.3g\n", rel);
+    require(rel < 5e-6, "mixed346: the tile kernel and the GEMV core agree within fp32 reassociation");
+  }
+  // The contract: the form is grouped-only, with codes.
+  {
+    bool refused = false;
+    try {
+      dgpp::launch_moe_grouped_mma_packq_f32(a.p, k, segs.p, ns, 130, views.p, 1, out.p, os, n, k, 0, stream, rows.p, sf3);
+    } catch (const std::invalid_argument&) {
+      refused = true;
+    }
+    require(refused, "mixed346: a launch without the codes is refused");
+    refused = false;
+    try {
+      Buffer<float> d(static_cast<size_t>(4) * n);
+      dgpp::launch_packq_gemm_f32(a.p, k, w4.view(), d.p, 4, n, k, stream);
+    } catch (const std::invalid_argument&) {
+      refused = true;
+    }
+    require(refused, "mixed346: the dense launcher refuses the form");
+  }
+  DGPP_CUDA_OK(cudaStreamDestroy(stream));
+  std::printf("[ OK ] packq gemm mixed346 grouped: oracle, forms, tile list, NaN, GEMV agreement, contract\n");
 }
 
 DGPP_TEST(packq_gemm_rejects_invalid_geometry) {

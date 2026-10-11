@@ -204,6 +204,12 @@ def configure(args, values, interactive):
                values.get("DGPP_RESIDENT_CACHE_DIR") or deployment.get("paths", {}).get("resident_cache") or "~/.cache/dgpp/resident")]
     if world > 1 or args.ssh_user is not None:
         fields.insert(0, ("DGPP_SSH_USER", args.ssh_user, "SSH login on peers", site_env.ssh_user(values)))
+    if "bind_host" not in deployment.get("http", {}):
+        fields.append(("DGPP_HTTP_BIND", args.http_bind,
+                       "HTTP bind address (0.0.0.0 = all interfaces, 127.0.0.1 = local only)",
+                       values["DGPP_HTTP_BIND"]))
+    else:
+        print(f"HTTP bind address: {deployment['http']['bind_host']} (set by deployment http.bind_host)")
     if "port" not in deployment.get("http", {}):
         fields.append(("DGPP_HTTP_PORT", args.http_port, "HTTP port on rank 0", values["DGPP_HTTP_PORT"]))
     for key, option, label, default in fields:
@@ -212,6 +218,8 @@ def configure(args, values, interactive):
             change(values, updates, key, value)
     if args.http_port is not None and "port" in deployment.get("http", {}) and args.http_port != deployment["http"]["port"]:
         raise ValueError("this deployment sets http.port; edit it there instead of using --http-port")
+    if args.http_bind is not None and "bind_host" in deployment.get("http", {}) and args.http_bind != deployment["http"]["bind_host"]:
+        raise ValueError("this deployment sets http.bind_host; edit it there instead of using --http-bind")
     # Keep deployment selection persistent without relying on a shell variable.
     change(values, updates, "DGPP_CLUSTER_CONFIG", str(target))
     cfg = site_env.resolve_config(source, values)
@@ -402,6 +410,7 @@ def parser():
     result.add_argument("--cache-dir", help="HF cache on each node, absolute or ~/ path; existing per-node overrides win")
     result.add_argument("--resident-cache-dir", help="resident image cache on each node; existing per-node overrides win")
     result.add_argument("--http-port", type=int, help="HTTP port unless the deployment sets http.port")
+    result.add_argument("--http-bind", help="HTTP IPv4 bind address (default: 0.0.0.0, all interfaces); deployment http.bind_host takes precedence")
     result.add_argument("--non-interactive", action="store_true", help="use flags/existing settings; never prompt")
     mode = result.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="read-only prerequisite checks; no files, installation, build or download")

@@ -4,6 +4,7 @@
 
 #include "common/cuda_check.hpp"
 #include "common/dtypes.hpp"
+#include "kernels/hadamard32.cuh"
 
 namespace dgpp {
 
@@ -54,6 +55,67 @@ __global__ void glm_rmsnorm_kernel(const uint16_t* __restrict__ x,
   extern __shared__ float smem[];  // [dim] staging for the second pass
   rmsnorm_row_two_rounding(x + static_cast<size_t>(row) * dim, w,
                            y + static_cast<size_t>(row) * dim, dim, eps, smem);
+}
+
+// The norm with the Mixed346 activation quantizer fused into its second
+// pass: the block's warps take the row's 128-value groups in turn (warp w
+// groups w, w + 16, ...; lane j element j of each of the group's four H32
+// blocks), write y as the kernel above does, then rotate the four bf16
+// values across the lanes, round, and emit the group's scale and codes
+// exactly as hadamard32_quant_int8_kernel does from y. The first pass and
+// the reduction are the kernel above's.
+__global__ void glm_rmsnorm_quant_int8_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
+                                              uint16_t* __restrict__ y, int8_t* __restrict__ codes,
+                                              size_t code_stride, float* __restrict__ scales,
+                                              size_t scale_stride, int dim, float eps) {
+  const int row = blockIdx.x;
+  extern __shared__ float smem[];
+  const uint16_t* xr = x + static_cast<size_t>(row) * dim;
+  uint16_t* yr = y + static_cast<size_t>(row) * dim;
+  const int tid = threadIdx.x;
+  const int nthreads = blockDim.x;
+  double ssq = 0.0;
+  for (int i = tid; i < dim; i += nthreads) {
+    const float v = bf16_bits_to_float(xr[i]);
+    smem[i] = v;
+    ssq += static_cast<double>(v) * v;
+  }
+  __syncthreads();
+  __shared__ double part[kBlock];
+  part[tid] = ssq;
+  __syncthreads();
+  for (int stride = nthreads / 2; stride > 0; stride >>= 1) {
+    if (tid < stride && tid + stride < blockDim.x) part[tid] += part[tid + stride];
+    __syncthreads();
+  }
+  const float rstd = rsqrtf(static_cast<float>(part[0] / dim) + eps);
+  const int warp = tid >> 5, lane = tid & 31, warps = nthreads >> 5;
+  const int groups = dim / 128;
+  int8_t* cr = codes + static_cast<size_t>(row) * code_stride;
+  for (int g = warp; g < groups; g += warps) {
+    const int c = g * 128;
+    float v[4];
+    float amax = 0.f;
+#pragma unroll
+    for (int b = 0; b < 4; ++b) {
+      const int i = c + b * kHadamard32Block + lane;
+      const uint16_t u = float_to_bf16_bits(smem[i] * rstd);
+      const uint16_t yv = float_to_bf16_bits(bf16_bits_to_float(w[i]) * bf16_bits_to_float(u));
+      yr[i] = yv;
+      v[b] = bf16_bits_to_float(hadamard32_warp_bf16(yv));
+      amax = fmaxf(amax, fabsf(v[b]));
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
+    const float s = fmaxf(__fdiv_rn(amax, 127.f), 1e-30f);
+#pragma unroll
+    for (int b = 0; b < 4; ++b) {
+      float q = rintf(__fdiv_rn(v[b], s));
+      q = fminf(fmaxf(q, -128.f), 127.f);
+      cr[c + b * kHadamard32Block + lane] = static_cast<int8_t>(static_cast<int>(q));
+    }
+    if (lane == 0) scales[static_cast<size_t>(row) * scale_stride + g] = s;
+  }
 }
 
 // The MTP draft block's input row: [enorm(embed[token]) | hnorm(hidden)].
@@ -172,6 +234,33 @@ void glm_rmsnorm_bf16(const void* x, const void* weight, void* y, int rows,
       static_cast<const uint16_t*>(x),
       static_cast<const uint16_t*>(weight),
       static_cast<uint16_t*>(y), dim, eps);
+  DGPP_CUDA_OK(cudaGetLastError());
+}
+
+void glm_rmsnorm_bf16_quant_int8(const void* x, const void* weight, void* y, int8_t* codes, size_t code_stride,
+                                 float* scales, size_t scale_stride, int rows, int dim, float eps,
+                                 cudaStream_t stream) {
+  if (rows <= 0) return;
+  if (!x || !weight || !y || !codes || !scales) throw std::invalid_argument("glm_rmsnorm_quant_int8: null buffer");
+  if (dim <= 0 || dim % 128 != 0 || code_stride < static_cast<size_t>(dim) ||
+      scale_stride < static_cast<size_t>(dim / 128))
+    throw std::invalid_argument("glm_rmsnorm_quant_int8: dim must be a multiple of 128 within the code / scale rows");
+  const size_t shmem = sizeof(float) * static_cast<size_t>(dim);
+  static const bool attr_ok = [] {
+    constexpr size_t kWant = 64ull << 10;
+    const cudaError_t e = cudaFuncSetAttribute(glm_rmsnorm_quant_int8_kernel,
+                                               cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kWant));
+    if (e != cudaSuccess) {
+      cudaGetLastError();
+      return false;
+    }
+    return true;
+  }();
+  if (!attr_ok && shmem > 49152) throw std::runtime_error("glm_rmsnorm_quant_int8: dynamic smem exceeds the limit");
+  cudaGetLastError();
+  glm_rmsnorm_quant_int8_kernel<<<rows, kBlock, shmem, stream>>>(
+      static_cast<const uint16_t*>(x), static_cast<const uint16_t*>(weight), static_cast<uint16_t*>(y), codes,
+      code_stride, scales, scale_stride, dim, eps);
   DGPP_CUDA_OK(cudaGetLastError());
 }
 

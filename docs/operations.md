@@ -59,7 +59,8 @@ shorter prefills retain their existing kernels in both modes.
 ## Configure and start
 
 For a new machine, follow [Getting started](getting-started.md),
-including dependency installation. HTTP defaults to localhost; deployment
+including dependency installation. HTTP defaults to all IPv4 interfaces
+(`0.0.0.0`); setup's bind-address prompt or `--http-bind` sets the site default. Deployment
 `http.bind_host` and `http.port` override `.env` defaults. The service has no
 TLS or authentication; see [networking](networking.md) before exposing it.
 
@@ -88,6 +89,8 @@ its node.
 | `cluster_qwen-3.8-flash-next_nvfp4-radixark_w{1,2}.example.json` | RadixArk Qwen NVFP4 on one or two Sparks; the single-Spark recipe selects MTP depth 2, grow admission and 4K busy/idle prefill |
 | `cluster_glm-4.7_nvfp4_w4.example.json` | GLM-4.7 NVFP4, four nodes, MTP depth 1 |
 | `cluster_glm-5.3_int4-int8_w4.example.json` | the full GLM-5.3 (int4/int8 RTN), four nodes, MTP depth 1, eight request slots, 100K bf16 context (120K with `--bf16-weights checkpoint --kv-capacity 122880`), the embedding vocab-sharded |
+| `cluster_glm-5.3_nf4i8_w4.example.json` | the full GLM-5.3 in the NF4I8 GPTQ H32 g128 checkpoint (codebook experts, int8 attention and shared expert), four nodes, MTP depth 1, eight request slots, 272K fp8 context, the embedding vocab-sharded |
+| `cluster_glm-5.3_mixed346_w4.example.json` | the full GLM-5.3 in the Mixed346 GPTQ H32 A8 g128 checkpoint (3/4/6-bit codebook experts with int8 activation codes, 116 int4 fallback experts, int8 attention and shared expert), four nodes, MTP depth 1, eight request slots, 272K fp8 context |
 | `cluster_deepseek-v4.1-flash_mxfp4-fp8_w4.example.json` | DeepSeek-V4.1-Flash as shipped, four nodes, six request slots, DSpark depth 4 with the scheduled verify depth, the bounded prefill, 128K context |
 | `cluster_mimo-v2.6-flash_mxfp4-fp8_w{4,2}.example.json` | MiMo-V2.6-Flash as shipped (MXFP4 experts, fp8 dense, the BF16 matrices in their 12-bit form), four nodes with a 128K BF16 K/V pool or two nodes with a 256K K/V pool in the fp8 row form (`kv_dtype`), four request slots, MTP depth 1 |
 
@@ -242,6 +245,19 @@ binary. It starts rank 0, waits for its rendezvous listener, starts peers
 through SSH and waits for `serve: listening`. That log line indicates
 HTTP readiness. Warm GLM-FP8 resident images took 15–25 s to reach it in
 the recorded deployment; the first checkpoint load took about 4.5 minutes.
+While waiting, the launcher prints rank 0's log path and reports elapsed
+time, process liveness and the latest log line every ten seconds. It checks
+the head process every two seconds; an exit reports its status and ten
+untruncated trailing log lines, then triggers peer cleanup. A living process
+that does not become ready still reaches the journal or HTTP timeout.
+
+`engine.kv_capacity` is one shared token pool across request slots, not a
+per-slot allocation multiplied by `engine.max_concurrency`. Four simultaneous
+262,144-token requests need 1,048,576 tokens plus prefix-snapshot bookkeeping
+space. The four-node Qwen FP8 template uses 1,052,672 tokens and four slots,
+with a 40 GiB prefix arena. Each request's context includes both its prompt
+and generated tokens. Full admission reserves that lifetime token budget;
+unused prefix entries can be evicted to free pool blocks for new requests.
 
 Use a separate config for each checkpoint. For example, a site-local
 `deploy/cluster_glm-5.3-flash_nvfp4-fp8_w4.json` can select the composed
@@ -483,6 +499,10 @@ To prevent swap for every serving rank launched by `dgpp-cluster`, use:
 ```bash
 DGPP_NO_SWAP=1 scripts/dgpp-cluster up --config deploy/cluster_glm-5.3-flash_nvfp4-fp8_w4.json
 ```
+
+Set `DGPP_NO_SWAP=1` in the site's `.env` to retain this policy across launches.
+The setting is resolved and forwarded to every rank. Existing processes need
+to be restarted to enter the protected scopes.
 
 The launcher runs each rank, and its preflight/status version probes, in a
 systemd user scope with `MemorySwapMax=0`.

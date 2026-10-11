@@ -215,6 +215,8 @@ class PortabilityTest(unittest.TestCase):
         models = {
             "HawkBearPig/GLM-5.3-Flash-NVFP4-FP8": "glm-5.3-flash_nvfp4-fp8",
             "HawkBearPig/GLM-5.3-Int4-Int8Mix-RTN-g64": "glm-5.3_int4-int8",
+            "HawkBearPig/GLM-5.3-NF4I8-GPTQ-H32-g128": "glm-5.3_nf4i8",
+            "HawkBearPig/GLM-5.3-Mixed346-GPTQ-H32-A8-g128": "glm-5.3_mixed346",
             "nvidia/GLM-4.7-NVFP4": "glm-4.7_nvfp4",
             "Qwen/Qwen3.8-Flash-Next-FP8": "qwen-3.8-flash-next_fp8",
             "nvidia/Qwen3.8-Flash-Next-NVFP4": "qwen-3.8-flash-next_nvfp4",

@@ -1,11 +1,14 @@
 #include "models/glm/moe_reference.hpp"
 
+#include "kernels/hadamard32.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
 #include "common/dtypes.hpp"
 #include "kernels/latent_format.hpp"
+#include "loaders/packq_quant.hpp"
 
 namespace dgpp {
 
@@ -90,25 +93,67 @@ std::vector<double> dequant_fp4_weights(const GlmFp4MatrixHost& mat) {
   return w;
 }
 
-// Packed-int weights: (code - 2^(bits-1)) x bf16(scale), EXACT (the
-// engine's exact policy, docs/glm53_plan.md D2: no bf16 rounding of the
-// weight; the group-factored fp32 chain differs from this by summation
-// order only).
+// Packed-int weights: level x scale, EXACT (the engine's exact policy,
+// docs/glm53_plan.md D2: no bf16 rounding of the weight; the
+// group-factored fp32 chain differs from this by summation order only).
+// The level is code - 2^(bits-1), or the codebook entry the stored index
+// selects under the NF4I8 format (packed_code_level).
 std::vector<double> dequant_packq_weights(const GlmPackedMatrixHost& mat) {
-  const int per = 32 / mat.bits;
   const int g = packed_scale_group(mat.scale_fmt);
-  const int64_t wc = mat.cols / per, sc = mat.cols / g;
-  const uint32_t mask = (1u << mat.bits) - 1u;
-  const int offset = 1 << (mat.bits - 1);
+  const int64_t sc = mat.cols / g;
   std::vector<double> w(static_cast<size_t>(mat.rows) * mat.cols);
   for (int64_t r = 0; r < mat.rows; ++r)
     for (int64_t c = 0; c < mat.cols; ++c) {
-      const uint32_t word = mat.packed[static_cast<size_t>(r) * wc + c / per];
-      const int code = static_cast<int>((word >> (mat.bits * (c % per))) & mask) - offset;
+      // The stored field (a dense stream under the Mixed346 format: the
+      // host codec reads across word boundaries) to its level.
+      const int level = packq_level(mat.packed, mat.cols, mat.bits, r, c, mat.scale_fmt);
       const float s = packed_scale_to_float(mat.scales[static_cast<size_t>(r) * sc + c / g], mat.scale_fmt);
-      w[static_cast<size_t>(r) * mat.cols + c] = static_cast<double>(code) * static_cast<double>(s);
+      w[static_cast<size_t>(r) * mat.cols + c] = static_cast<double>(level) * static_cast<double>(s);
     }
   return w;
+}
+
+// The Mixed346 activation codes of one rotated bf16 row (the quantizer's
+// arithmetic, kernels/hadamard32.hpp) as the values they represent, code
+// x scale, in double: the oracle multiplies those.
+std::vector<double> a8_represented(const std::vector<uint16_t>& rotated) {
+  std::vector<double> out(rotated.size());
+  int8_t codes[128];
+  for (size_t c = 0; c < rotated.size(); c += 128) {
+    const float s = hadamard32_quant_int8_group_host(rotated.data() + c, codes);
+    for (int j = 0; j < 128; ++j) out[c + j] = static_cast<double>(codes[j]) * static_cast<double>(s);
+  }
+  return out;
+}
+// strict_gemm / strict_gemm_raw over double activations (the represented
+// int8 codes): bf16-rounded or raw outputs as those.
+void strict_gemm_d(const std::vector<double>& act, const std::vector<double>& weights, int n, int k,
+                   std::vector<uint16_t>& out) {
+  out.assign(static_cast<size_t>(n), 0);
+  for (int nn = 0; nn < n; ++nn) {
+    const double* wrow = weights.data() + static_cast<size_t>(nn) * k;
+    double acc = 0.0;
+    for (int kk = 0; kk < k; ++kk) acc += act[static_cast<size_t>(kk)] * wrow[kk];
+    out[static_cast<size_t>(nn)] = d_to_bf16(acc);
+  }
+}
+void strict_gemm_raw_d(const std::vector<double>& act, const std::vector<double>& weights, int n, int k,
+                       std::vector<double>& out) {
+  out.assign(static_cast<size_t>(n), 0.0);
+  for (int nn = 0; nn < n; ++nn) {
+    const double* wrow = weights.data() + static_cast<size_t>(nn) * k;
+    double acc = 0.0;
+    for (int kk = 0; kk < k; ++kk) acc += act[static_cast<size_t>(kk)] * wrow[kk];
+    out[static_cast<size_t>(nn)] = acc;
+  }
+}
+
+// The routed experts' H32 input rotation (kernels/hadamard32.hpp's
+// arithmetic: fp32 butterflies, one bf16 rounding) of one bf16 row.
+std::vector<uint16_t> rotate_h32(const std::vector<uint16_t>& row) {
+  std::vector<uint16_t> out(row.size());
+  hadamard32_rows_host(row.data(), row.size(), out.data(), out.size(), 1, static_cast<int>(row.size()));
+  return out;
 }
 
 // Decode payload x scales, rounded to bf16 (the engine's weight policy).
@@ -180,26 +225,22 @@ GlmPackedMatrixHost glm_moe_host_view_packq(const GlmMoeHostWeights& w,
   const int64_t I = cfg.inter, H = cfg.hidden;
   GlmPackedMatrixHost m;
   const bool down = index % 3 == 2;
-  const bool shared = index >= E * 3;
   m.rows = down ? H : I;
   m.cols = down ? I : H;
-  m.bits = shared ? w.packq_bits_shared : w.packq_bits_routed;
-  // Every routed matrix has the same element count (gate/up [I,H], down
-  // [H,I]) and width; the shared triple the same shapes at its own width.
+  // Every matrix has the same element count (gate/up [I,H], down [H,I]);
+  // each carries its own width and scale format (uniform routed ones, the
+  // shared triple at its width in bf16 per 64, or the Mixed346 per-matrix
+  // forms), so a matrix's offset is the sum of the sizes before it.
   const int64_t elems = I * H;
-  const int64_t words_r = elems * w.packq_bits_routed / 32;
-  const int64_t words_s = elems * w.packq_bits_shared / 32;
-  // The routed matrices carry the weights' scale format; the shared triple
-  // is always bf16 per 64 (the slot kernels' shared width and format).
-  m.scale_fmt = shared ? kPackedScaleBf16G64 : w.packq_scale_fmt;
-  const int64_t scales_r = elems / packed_scale_group(w.packq_scale_fmt);
-  const int64_t scales_s = elems / kPackedGroup;
-  const int64_t scales_per = shared ? scales_s : scales_r;
-  const size_t p_off = shared ? static_cast<size_t>(E) * 3 * words_r + static_cast<size_t>(index - E * 3) * words_s
-                              : static_cast<size_t>(index) * words_r;
-  const size_t s_off = shared ? static_cast<size_t>(E) * 3 * scales_r + static_cast<size_t>(index - E * 3) * scales_s
-                              : static_cast<size_t>(index) * scales_r;
-  const int64_t words = shared ? words_s : words_r;
+  m.bits = w.packq_bits_of(index, E);
+  m.scale_fmt = w.packq_fmt_of(index, E);
+  size_t p_off = 0, s_off = 0;
+  for (int i = 0; i < index; ++i) {
+    p_off += static_cast<size_t>(elems * w.packq_bits_of(i, E) / 32);
+    s_off += static_cast<size_t>(elems / packed_scale_group(w.packq_fmt_of(i, E)));
+  }
+  const size_t words = static_cast<size_t>(elems * m.bits / 32);
+  const size_t scales_per = static_cast<size_t>(elems / packed_scale_group(m.scale_fmt));
   if (p_off + words > w.packq_words.size() || s_off + scales_per > w.packq_scales.size())
     throw std::invalid_argument("glm_moe_host_view_packq: index out of range");
   m.packed = w.packq_words.data() + p_off;
@@ -356,11 +397,24 @@ void glm_moe_ref_forward(const uint16_t* hidden, const GlmMoeHostWeights& w,
   // weight 1, and the sum rounds to bf16 exactly once. (The transformers
   // reference rounds per expert add; the engine deliberately does not —
   // see glm_moe_layer.hpp.)
+  // The routed experts' inputs under the H32 rotation (the NF4I8
+  // checkpoint): the expert input before gate / up, the SwiGLU output
+  // before down — rotated rows in the engine's exact arithmetic (one
+  // bf16 rounding); the shared expert reads the plain rows.
+  const bool a8 = w.routed_input_transform == kMoeInputHadamard32Int8;
+  const bool rotate = w.routed_input_transform == kMoeInputHadamard32 || a8;
+  if (rotate && (H % 32 != 0 || I % 32 != 0))
+    throw std::invalid_argument("glm_moe_ref_forward: the H32 rotation needs hidden and inter multiples of 32");
+  if (a8 && (H % 128 != 0 || I % 128 != 0))
+    throw std::invalid_argument("glm_moe_ref_forward: the int8 activation codes need hidden and inter multiples of 128");
   std::vector<uint16_t> gate_out, up_out, act;
   std::vector<double> down_out, acc(static_cast<size_t>(H));
   for (int t = 0; t < tokens; ++t) {
     const uint16_t* x = hidden + static_cast<size_t>(t) * H;
     std::vector<uint16_t> xrow(x, x + H);
+    const std::vector<uint16_t> xrot = rotate ? rotate_h32(xrow) : xrow;
+    // The Mixed346 codes of the rotated row, as the values they represent.
+    const std::vector<double> xq = a8 ? a8_represented(xrot) : std::vector<double>{};
     std::fill(acc.begin(), acc.end(), 0.0);
     for (int i = 0; i < K; ++i) {
       const int e = route.ids[static_cast<size_t>(t) * K + i];
@@ -369,10 +423,22 @@ void glm_moe_ref_forward(const uint16_t* hidden, const GlmMoeHostWeights& w,
       const Mat wg = weights_for(e * 3 + 0);
       const Mat wu = weights_for(e * 3 + 1);
       const Mat wd = weights_for(e * 3 + 2);
-      strict_gemm(xrow, H, wg.w, 1, I, H, gate_out, wg.divisor);
-      strict_gemm(xrow, H, wu.w, 1, I, H, up_out, wu.divisor);
-      swiglu_oracle(gate_out, up_out, I, cfg.swiglu_limit, act);
-      strict_gemm_raw(act, I, wd.w, 1, H, I, down_out, wd.divisor);
+      // A converted (format 3) expert of a Mixed346 layer multiplies the
+      // codes; an existing one the plain rows; any other layer its rows.
+      const bool conv = a8 && w.packq_fmt_of(e * 3, E) == kPackedScaleBf16G128Mixed346;
+      if (conv) {
+        strict_gemm_d(xq, wg.w, I, H, gate_out);
+        strict_gemm_d(xq, wu.w, I, H, up_out);
+        swiglu_oracle(gate_out, up_out, I, cfg.swiglu_limit, act);
+        strict_gemm_raw_d(a8_represented(rotate_h32(act)), wd.w, H, I, down_out);
+      } else {
+        const std::vector<uint16_t>& xin = a8 ? xrow : xrot;
+        strict_gemm(xin, H, wg.w, 1, I, H, gate_out, wg.divisor);
+        strict_gemm(xin, H, wu.w, 1, I, H, up_out, wu.divisor);
+        swiglu_oracle(gate_out, up_out, I, cfg.swiglu_limit, act);
+        if (rotate && !a8) act = rotate_h32(act);
+        strict_gemm_raw(act, I, wd.w, 1, H, I, down_out, wd.divisor);
+      }
       for (int d = 0; d < H; ++d) acc[d] += we * down_out[d];
     }
     // Shared expert, weight 1, added last.

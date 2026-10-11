@@ -379,8 +379,16 @@ void launch_moe_slot_down_fp4(const uint16_t* act, size_t act_stride,
 // compiled set). Every row's arithmetic is the packed core's, bitwise
 // across the grouped and slot launchers and the single-matrix launcher.
 // scale_fmt / routed_scale_fmt: the routed entries' packed scale format
-// (kPackedScale*, quant_matrix.hpp; 0 = bf16 per 64, 1 = f16 per 128); the
-// shared expert's entries are always format 0.
+// (kPackedScale*, quant_matrix.hpp; 0 = bf16 per 64, 1 = f16 per 128, 2 =
+// the NF4I8 codebook, bf16 per 128); the shared expert's entries are
+// always format 0.
+// The NF4I8 checkpoint's H32 input rotation (kMoeInputHadamard32,
+// models/glm/moe.hpp) is the layer's: the grouped launchers read rows the
+// layer rotated (kernels/hadamard32.cu); the slot gate/up launcher takes
+// the rotated token rows as `x_routed` (nullptr: the rows of `x`), which
+// the routed slots stage while the shared slot stages `x`; the slot down
+// launcher reads activation rows the layer rotated in place (the shared
+// slots' rows skipped).
 void launch_moe_grouped_gemv_packq_bf16(const uint16_t* act, size_t act_stride,
                                         const MoeSegment* segs, int n_segs,
                                         int max_rows, int rows_per_block,
@@ -400,7 +408,7 @@ void launch_moe_slot_gate_up_swiglu_packq(
     const MoeExpertView* views, int n_routed, int k_routed, int routed_bits,
     int n_shared, int shared_bits, uint16_t* act, int act_stride, int slots,
     int top_k, float limit, cudaStream_t stream, int shared_view_base,
-    int routed_scale_fmt = 0);
+    int routed_scale_fmt = 0, const uint16_t* x_routed = nullptr);
 void launch_moe_slot_down_packq(const uint16_t* act, size_t act_stride,
                                 const int32_t* ids, const int32_t* order,
                                 const MoeExpertView* views, int n_routed, int k_routed,
@@ -408,5 +416,40 @@ void launch_moe_slot_down_packq(const uint16_t* act, size_t act_stride,
                                 float* out, int out_stride, int slots, int top_k,
                                 cudaStream_t stream, int shared_view_base,
                                 int routed_scale_fmt = 0);
+
+// ---- the Mixed346 routed experts (2026-10-09, kMoeInputHadamard32Int8) ----
+// The same contracts over expert-view tables that mix forms expert by
+// expert (HawkBearPig/GLM-5.3-Mixed346-GPTQ-H32-A8-g128): a converted
+// triple (packed_scale_fmt kPackedScaleBf16G128Mixed346, bits 3 / 4 / 6 —
+// gate and up at one width) multiplies the rows' INT8 codes (`x_codes` /
+// `act_codes`, 16-byte aligned rows of k bytes) and fp32 scales
+// (`x_scales` / `act_scales`, k / 128 a row) — the layer's quantized
+// copies (kernels/hadamard32.hpp) of the rows a baseline (format 0, int4
+// g64) expert and the shared expert (int8 g64, view-table entries
+// [shared_view_base, +3)) read plain from `x` / `act`. k must be a
+// multiple of 128 in both cores' compiled sets (128, 256, 512, 1024,
+// 2048, 6144). The grouped launchers take the ROUTED segments only; the
+// shared segment keeps the packed int8 grouped launcher.
+void launch_moe_slot_gate_up_swiglu_m346(const uint16_t* x, size_t x_stride, const int8_t* x_codes,
+                                         size_t x_code_stride, const float* x_scales, size_t x_scale_stride,
+                                         const int32_t* ids, const int32_t* order, const MoeExpertView* views,
+                                         int n_routed, int k_routed, int n_shared, uint16_t* act, int act_stride,
+                                         int slots, int top_k, float limit, cudaStream_t stream,
+                                         int shared_view_base);
+void launch_moe_slot_down_m346(const uint16_t* act, size_t act_stride, const int8_t* act_codes,
+                               size_t act_code_stride, const float* act_scales, size_t act_scale_stride,
+                               const int32_t* ids, const int32_t* order, const MoeExpertView* views, int n_routed,
+                               int k_routed, int n_shared, float* out, int out_stride, int slots, int top_k,
+                               cudaStream_t stream, int shared_view_base);
+void launch_moe_grouped_gemv_m346_bf16(const uint16_t* act, size_t act_stride, const int8_t* act_codes,
+                                       size_t act_code_stride, const float* act_scales, size_t act_scale_stride,
+                                       const MoeSegment* segs, int n_segs, int max_rows, int rows_per_block,
+                                       const MoeExpertView* views, int which, uint16_t* out, size_t out_stride,
+                                       int n, int k, cudaStream_t stream);
+void launch_moe_grouped_gemv_m346_f32(const uint16_t* act, size_t act_stride, const int8_t* act_codes,
+                                      size_t act_code_stride, const float* act_scales, size_t act_scale_stride,
+                                      const MoeSegment* segs, int n_segs, int max_rows, int rows_per_block,
+                                      const MoeExpertView* views, int which, float* out, size_t out_stride, int n,
+                                      int k, cudaStream_t stream);
 
 }  // namespace dgpp

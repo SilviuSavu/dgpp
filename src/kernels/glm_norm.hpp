@@ -19,6 +19,17 @@ namespace dgpp {
 void glm_rmsnorm_bf16(const void* x, const void* weight, void* y, int rows,
                       int dim, float eps, cudaStream_t stream);
 
+// The norm above and, from the same y, the Mixed346 layers' expert-input
+// codes (2026-10-10): each row's y rotated by H32 and quantized per 128
+// values to int8 codes with one fp32 scale — bitwise
+// launch_hadamard32_quant_int8_rows(y) (kernels/hadamard32.cu) fused into
+// the norm's second pass, so a decode step records one kernel per MoE
+// layer here instead of two. codes: int8 [rows, code_stride >= dim];
+// scales: fp32 [rows, scale_stride >= dim / 128]. dim a multiple of 128.
+void glm_rmsnorm_bf16_quant_int8(const void* x, const void* weight, void* y, int8_t* codes, size_t code_stride,
+                                 float* scales, size_t scale_stride, int rows, int dim, float eps,
+                                 cudaStream_t stream);
+
 // Initializes the mHC residual streams: streams[t, s, h] = embed[tokens[t],
 // h] for all s < hc_mult (the reference's expand of the embedding). hc_mult
 // is pinned to 4 by the config parser (kernel smem layouts assume it).

@@ -164,7 +164,7 @@ constexpr int kSteps = 60;
 constexpr int kMaxTokens = 64;
 constexpr int64_t kCache = 512;
 constexpr int kWorld = 2;
-constexpr uint16_t kPort = 29954;  // 29954 (graph vs eager), 29955 (mtp), 29956 (depth 2), 29957 (sharded), 29960 (sixteen rows)
+constexpr uint16_t kPort = 29954;  // 29954 (graph vs eager), 29955 (mtp), 29956 (depth 2), 29957 (sharded), 29960 (sixteen rows), 29976 (nf4i8 graph vs eager)
 
 
 // The batched engines against the eager one at the same world (2026-09-14):
@@ -719,6 +719,34 @@ DGPP_TEST(glm_dsa_engines_loopback_world_2_graph_matches_eager) {
   require(sharded.ga == replicated.ga && sharded.ba == replicated.ba && sharded.bb == replicated.bb &&
               sharded.bc == replicated.bc,
           "the vocab-sharded embedding changes the graph transcripts");
+}
+
+// The NF4I8 contract's fixture: the recorded decode step's codebook slot
+// kernels with their in-smem rotation, bitwise the eager transcripts.
+DGPP_TEST(glm_dsa_engines_loopback_world_2_graph_matches_eager_nf4i8) {
+  const GlmDsaTextConfig cfg = glmdsafx::tiny_config(5, 1, true, true);
+  const std::string dir = "glm_dsa_engine_fixture_nf4i8";
+  glmdsafx::write_fixture(cfg, dir, true);
+  const std::vector<int64_t> A = smoke_tokens(cfg, 23, 0x9E3779B97F4A7C15ull);
+  const std::vector<int64_t> B = smoke_tokens(cfg, 17, 0xD1B54A32D192ED03ull);
+  const std::vector<int64_t> C = smoke_tokens(cfg, 11, 0x2545F4914F6CDD1Dull);
+  const Ref ref = world1_reference(cfg, dir, A, B, C);
+  DGPP_LOG_INFO("world 1 eager (nf4i8): A {} | B {} | C {}", ids_text(ref.a), ids_text(ref.b), ids_text(ref.c));
+  (void)graph_world(cfg, dir, A, B, C, ref, static_cast<uint16_t>(29976));
+}
+
+// The Mixed346 contract's fixture: the recorded decode step's quantizer
+// and mixed-form slot kernels, bitwise the eager transcripts.
+DGPP_TEST(glm_dsa_engines_loopback_world_2_graph_matches_eager_m346) {
+  const GlmDsaTextConfig cfg = glmdsafx::tiny_config(5, 1, true, false, 8, true);
+  const std::string dir = "glm_dsa_engine_fixture_m346";
+  glmdsafx::write_fixture(cfg, dir, false, 8, true);
+  const std::vector<int64_t> A = smoke_tokens(cfg, 23, 0x9E3779B97F4A7C15ull);
+  const std::vector<int64_t> B = smoke_tokens(cfg, 17, 0xD1B54A32D192ED03ull);
+  const std::vector<int64_t> C = smoke_tokens(cfg, 11, 0x2545F4914F6CDD1Dull);
+  const Ref ref = world1_reference(cfg, dir, A, B, C);
+  DGPP_LOG_INFO("world 1 eager (mixed346): A {} | B {} | C {}", ids_text(ref.a), ids_text(ref.b), ids_text(ref.c));
+  (void)graph_world(cfg, dir, A, B, C, ref, static_cast<uint16_t>(29998));
 }
 
 int main() { return dgpp::test::run_all(); }

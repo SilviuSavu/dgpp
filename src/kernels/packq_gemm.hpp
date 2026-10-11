@@ -2,6 +2,12 @@
 // Packed int4/int8 prefill: exact integer codes on BF16 tensor cores,
 // then FP32 scaling of each 64-element group's partial dot. Weights are
 // never rounded to BF16. The summation order differs from packq_gemv.
+// Under the NF4I8 codebook format (kPackedScaleBf16G128Nf4i8, 2026-10-08)
+// the tensor core takes the codebook level the nibble indexes, exact in
+// bf16 like the offset code; the group's scale is applied per 64-deep
+// step as under the f16-per-128 format. The activation rotation that
+// checkpoint needs is the caller's (models/glm/moe_layer.cpp rotates the
+// routed rows it feeds these launchers).
 #include "kernels/glm_moe_launch.hpp"
 #include "models/quant_matrix.hpp"
 
@@ -54,6 +60,15 @@ constexpr int kPackqGemmWideRows = 64;
 // read view `which2` and write `out2` (the same stride), each token row
 // gathered once for both; every element's chain is the separate launch's
 // (bitwise). The gate and up projections of the packed chain run so.
+// The Mixed346 form (2026-10-09, scale_fmt kPackedScaleBf16G128Mixed346):
+// `act_q` / `act_s` are the rows' int8 codes (16-byte aligned rows of k
+// bytes at act_q_stride, mapped through act_rows like `act`) and their
+// fp32 scales (k / 128 a row); a tile whose view is a converted triple
+// multiplies them at the view's width (3 / 4 / 6, `bits` 0 = per view),
+// each 128-code group's exact dot scaled once by the weight and
+// activation scales; a tile whose view is an existing expert's int4 g64
+// triple reads the bf16 rows of `act` as the group-64 chain. The wide
+// decoded-tile kernels only (the default and "wide4").
 void launch_moe_grouped_mma_packq_bf16(const uint16_t* act, size_t act_stride,
                                        const MoeSegment* segs, int n_segs, int max_rows,
                                        const MoeExpertView* views, int which, uint16_t* out,
@@ -62,7 +77,9 @@ void launch_moe_grouped_mma_packq_bf16(const uint16_t* act, size_t act_stride,
                                        int scale_fmt = 0, int variant = -1,
                                        const MoeTile* tiles = nullptr,
                                        const int32_t* tile_count = nullptr, int tile_cap = 0,
-                                       uint16_t* out2 = nullptr, int which2 = -1);
+                                       uint16_t* out2 = nullptr, int which2 = -1,
+                                       const int8_t* act_q = nullptr, size_t act_q_stride = 0,
+                                       const float* act_s = nullptr, size_t act_s_stride = 0);
 void launch_moe_grouped_mma_packq_f32(const uint16_t* act, size_t act_stride,
                                       const MoeSegment* segs, int n_segs, int max_rows,
                                       const MoeExpertView* views, int which, float* out,
@@ -70,7 +87,9 @@ void launch_moe_grouped_mma_packq_f32(const uint16_t* act, size_t act_stride,
                                       cudaStream_t stream, const int32_t* act_rows = nullptr,
                                       int scale_fmt = 0, int variant = -1,
                                       const MoeTile* tiles = nullptr,
-                                      const int32_t* tile_count = nullptr, int tile_cap = 0);
+                                      const int32_t* tile_count = nullptr, int tile_cap = 0,
+                                      const int8_t* act_q = nullptr, size_t act_q_stride = 0,
+                                      const float* act_s = nullptr, size_t act_s_stride = 0);
 // The kernel the default `variant` selects (engine.expert_gemm: "wide" = 1,
 // "wide3" = 2, "wide4" = 4, "wide4r" = 5, "narrow" = 0; never 3 — the folded
 // form is engine.prefill_fold_scales) and the L2 prefetch distance

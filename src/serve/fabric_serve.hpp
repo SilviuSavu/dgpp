@@ -158,6 +158,8 @@ struct WorldSettings {
   std::string prefill = "bounded";           // the DeepSeek-V4.1 prefill mode: bounded | exact
   std::optional<dgpp::RopeScaling> rope_scaling;  // the opt-in YaRN ramp: absent = plain
   std::string embed_sharding = "replicated";  // the full GLM-5.3's embedding: replicated | vocab
+  std::string mtp_head = "checkpoint";        // the full GLM-5.3 draft head: checkpoint | fp8
+  std::string attention_weights = "checkpoint";  // the full GLM-5.3 attention projections: checkpoint | int4
   int default_max_tokens = 0;
   int queue_limit = 0;
   bool no_eos = false;

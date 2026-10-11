@@ -28,7 +28,9 @@ N configured nodes. `.env` is parsed as data, not sourced as Bash, and unrelated
 entries such as access tokens are not loaded by the site helper.
 
 HTTP clients either take their endpoint as arguments or use the selected
-deployment's HTTP settings. Shared defaults bind to localhost. Request model
+deployment's HTTP settings. Shared defaults bind to all IPv4 interfaces
+(`0.0.0.0`); setup prompts for the bind address and accepts `--http-bind` for
+unattended configuration. Request model
 IDs are discovered from `/v1/models` unless explicitly supplied. Family-specific
 native checks still require an appropriate model. The failure, stop, and serving
 soak procedures require four ranks and reject other worlds before starting.

@@ -20,6 +20,19 @@
 // `ignore` rules exactly as compressed-tensors applies them (a `re:` entry
 // is a regex anchored at the start of the module name, anything else an
 // exact name), then checked to be the one shape the loader implements.
+//
+// The NF4I8 contract (HawkBearPig/GLM-5.3-NF4I8-GPTQ-H32-g128, 2026-10-08,
+// quant_method `dgpp_nf4i8`, format `mixed-codebook-packed` version 1):
+// the same shape with the routed experts of the packed layers as
+// `weight_indices` I32 [N, K/8] (4-bit indices into the fixed 16-level
+// int8 codebook kNf4i8Codebook, the low nibble first), `weight_scale`
+// BF16 [N, K/128] and `weight_shape`; the attention and shared-expert
+// triples retained from the int8 g64 baseline. The experts were quantized
+// in a rotated input basis (a normalized 32-wide Hadamard on their input
+// channels: gate/up on the expert input, down on the SwiGLU output), so
+// the engine rotates the routed experts' inputs the same way
+// (expert_input_hadamard32). The file's codebook and transform must equal
+// the ones the kernels compile; anything else is rejected by name.
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -81,16 +94,41 @@ struct GlmDsaTextConfig {
   int num_nextn_predict_layers = 1;  // 0 or 1
 
   // --- packed-int weight formats (plan D2) -----------------------------------
-  int packed_group_size = 64;   // elements per scale along K (the cores implement 64)
+  int packed_group_size = 64;   // elements per scale along K of the attention / shared triples (the cores implement 64)
   int attention_bits = 8;       // q_a, q_b, kv_a, kv_b, o_proj of the packed layers
   int shared_bits = 8;          // the shared expert of the packed layers
   int expert_bits = 4;          // the routed experts of the packed layers
   int packed_layer_begin = 3;   // [begin, end): the main layers whose matrices are packed
   int packed_layer_end = 78;
+  // The routed experts' packed scale format on the packed layers
+  // (kPackedScale*, models/quant_matrix.hpp): bf16 per 64 offset codes
+  // (compressed-tensors), or the NF4I8 codebook with bf16 scales per 128.
+  int expert_scale_fmt = kPackedScaleBf16G64;
+  // The routed experts' inputs are rotated by a normalized 32-wide
+  // Hadamard before every projection (the NF4I8 checkpoint's basis).
+  bool expert_input_hadamard32 = false;
+  int expert_group_size() const { return packed_scale_group(expert_scale_fmt); }
+  // The Mixed346 contract (2026-10-09, quant_method dgpp_mixed346,
+  // HawkBearPig/GLM-5.3-Mixed346-GPTQ-H32-A8-g128): the routed experts of
+  // the packed layers are, expert by expert, either a converted triple
+  // (kPackedScaleBf16G128Mixed346: gate and up at one width of 3, 4 or 6
+  // bits, down at its own; H32-rotated int8 activations, one fp32 scale per
+  // 128) or the baseline's int4 g64 triple with bf16 activations
+  // ("existing"). expert_recipe[l * n_routed_experts + e] for every main
+  // layer l: 0 = not listed (an unpacked layer), kExpertRecipeExisting, or
+  // (gate_up_bits << 4) | down_bits.
+  std::vector<uint8_t> expert_recipe;
+  static constexpr uint8_t kExpertRecipeExisting = 1;
+  // The routed experts' activation codes: 8 = dynamic int8 per 128 rotated
+  // values (the Mixed346 contract), 0 = bf16.
+  int expert_activation_bits = 0;
+  bool expert_mixed346() const { return expert_scale_fmt == kPackedScaleBf16G128Mixed346; }
 
   // Parses config.json's root object. Throws std::runtime_error naming the
-  // offending field on anything unsupported.
-  static GlmDsaTextConfig parse(const minijson::Value& root);
+  // offending field on anything unsupported. `dir` is the checkpoint
+  // directory the contract's sidecar files (the Mixed346 recipe and
+  // baseline config) are read from; without it those must be inlined.
+  static GlmDsaTextConfig parse(const minijson::Value& root, const std::string& dir = "");
   static GlmDsaTextConfig from_json_file(const std::string& path);
 
   // Layer index of the draft layer (num_hidden_layers), -1 when absent.
@@ -118,6 +156,28 @@ struct GlmDsaTextConfig {
   int attention_bits_of(int l) const { return packed_layer(l) ? attention_bits : 0; }
   int shared_bits_of(int l) const { return packed_layer(l) ? shared_bits : 0; }
   int expert_bits_of(int l) const { return packed_layer(l) ? expert_bits : 0; }
+  // The routed experts' scale format on layer `l` (the draft's requantized
+  // experts take the baseline form, group 64, unrotated).
+  int expert_scale_fmt_of(int l) const { return packed_layer(l) ? expert_scale_fmt : kPackedScaleBf16G64; }
+  bool expert_input_hadamard32_of(int l) const { return packed_layer(l) && expert_input_hadamard32; }
+  int expert_activation_bits_of(int l) const { return packed_layer(l) ? expert_activation_bits : 0; }
+  // One routed expert's triple under the Mixed346 contract: its scale
+  // format (3 for a converted expert, 0 for an existing one, the draft's
+  // and every other contract's) and the width of projection `which` (0
+  // gate, 1 up, 2 down).
+  uint8_t expert_recipe_of(int l, int e) const {
+    if (!expert_mixed346() || !packed_layer(l)) return 0;
+    return expert_recipe[static_cast<size_t>(l) * static_cast<size_t>(n_routed_experts) + static_cast<size_t>(e)];
+  }
+  int expert_scale_fmt_of(int l, int e) const {
+    const uint8_t r = expert_recipe_of(l, e);
+    return r > kExpertRecipeExisting ? kPackedScaleBf16G128Mixed346 : expert_scale_fmt_of(l) == kPackedScaleBf16G128Mixed346 ? kPackedScaleBf16G64 : expert_scale_fmt_of(l);
+  }
+  int expert_proj_bits_of(int l, int e, int which) const {
+    const uint8_t r = expert_recipe_of(l, e);
+    if (r > kExpertRecipeExisting) return which == 2 ? (r & 15) : (r >> 4);
+    return expert_bits_of(l);
+  }
 
   // The routed chain's configuration (models/glm/moe.hpp): the GLM sigmoid
   // router, the shared expert in the chain, no swiglu clamps. `local_inter`

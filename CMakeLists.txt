@@ -169,8 +169,10 @@ add_library(dgpp_kernels STATIC
   src/kernels/fp8_per_tensor.cu
   src/kernels/fp4_gemv.cu
   src/kernels/packq_gemv.cu
+  src/kernels/packq_a8_gemv.cu
   src/kernels/packq_gemm.cu
   src/kernels/packq_head.cu
+  src/kernels/hadamard32.cu
   src/kernels/scale_gemm.cu
   src/kernels/bf16_gemv.cu
   src/kernels/bf12_gemv.cu
@@ -1418,6 +1420,64 @@ target_link_libraries(glm_dsa_decode_test PRIVATE dgpp_models_glm_dsa_layers dgp
 dgpp_set_common(glm_dsa_decode_test)
 add_test(NAME glm_dsa_decode_test COMMAND glm_dsa_decode_test --fixture ${GLM_DSA_FORWARD_FIXTURE})
 set_tests_properties(glm_dsa_decode_test PROPERTIES DEPENDS glm_dsa_forward_fixture)
+# The NF4I8 contract's fixture (codebook routed experts, H32-rotated): the
+# forward smoke and the decode gates run on it too.
+set(GLM_DSA_NF4I8_FIXTURE ${CMAKE_BINARY_DIR}/glm_dsa_forward_fixture_nf4i8)
+add_test(NAME glm_dsa_forward_fixture_nf4i8 COMMAND glm_dsa_forward_test --write-fixture-nf4i8 ${GLM_DSA_NF4I8_FIXTURE})
+add_test(NAME glm_dsa_forward_smoke_nf4i8 COMMAND glm_dsa_forward_test --smoke ${GLM_DSA_NF4I8_FIXTURE})
+set_tests_properties(glm_dsa_forward_smoke_nf4i8 PROPERTIES DEPENDS glm_dsa_forward_fixture_nf4i8)
+add_test(NAME glm_dsa_decode_test_nf4i8 COMMAND glm_dsa_decode_test --fixture ${GLM_DSA_NF4I8_FIXTURE})
+set_tests_properties(glm_dsa_decode_test_nf4i8 PROPERTIES DEPENDS glm_dsa_forward_fixture_nf4i8)
+# The pure-double reference over the nf4i8 fixture (the codebook decode and
+# the rotated routed inputs in tools/glm_dsa_reference_dump.py) and the
+# engine's parity with it.
+add_test(NAME glm_dsa_forward_generate_nf4i8
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/glm_dsa_reference_dump.py
+          gen-pure --checkpoint-dir ${GLM_DSA_NF4I8_FIXTURE}
+          --out ${CMAKE_CURRENT_BINARY_DIR}/glm_dsa_pure_ref_nf4i8.gdsdump)
+set_tests_properties(glm_dsa_forward_generate_nf4i8 PROPERTIES DEPENDS glm_dsa_forward_fixture_nf4i8)
+add_test(NAME glm_dsa_forward_test_nf4i8
+  COMMAND glm_dsa_forward_test --checkpoint-dir ${GLM_DSA_NF4I8_FIXTURE}
+          --dump-file ${CMAKE_CURRENT_BINARY_DIR}/glm_dsa_pure_ref_nf4i8.gdsdump)
+set_tests_properties(glm_dsa_forward_test_nf4i8 PROPERTIES DEPENDS glm_dsa_forward_generate_nf4i8)
+# The Mixed346 contract's fixture (every expert form on every packed layer,
+# int8 activation codes): the forward smoke, the decode gate and the
+# pure-reference parity run on it too.
+set(GLM_DSA_M346_FIXTURE ${CMAKE_BINARY_DIR}/glm_dsa_forward_fixture_m346)
+add_test(NAME glm_dsa_forward_fixture_m346 COMMAND glm_dsa_forward_test --write-fixture-m346 ${GLM_DSA_M346_FIXTURE})
+add_test(NAME glm_dsa_forward_smoke_m346 COMMAND glm_dsa_forward_test --smoke ${GLM_DSA_M346_FIXTURE})
+set_tests_properties(glm_dsa_forward_smoke_m346 PROPERTIES DEPENDS glm_dsa_forward_fixture_m346)
+add_test(NAME glm_dsa_decode_test_m346 COMMAND glm_dsa_decode_test --fixture ${GLM_DSA_M346_FIXTURE})
+set_tests_properties(glm_dsa_decode_test_m346 PROPERTIES DEPENDS glm_dsa_forward_fixture_m346)
+add_test(NAME glm_dsa_forward_generate_m346
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/glm_dsa_reference_dump.py
+          gen-pure --checkpoint-dir ${GLM_DSA_M346_FIXTURE}
+          --out ${CMAKE_CURRENT_BINARY_DIR}/glm_dsa_pure_ref_m346.gdsdump)
+set_tests_properties(glm_dsa_forward_generate_m346 PROPERTIES DEPENDS glm_dsa_forward_fixture_m346)
+add_test(NAME glm_dsa_forward_test_m346
+  COMMAND glm_dsa_forward_test --checkpoint-dir ${GLM_DSA_M346_FIXTURE}
+          --dump-file ${CMAKE_CURRENT_BINARY_DIR}/glm_dsa_pure_ref_m346.gdsdump)
+set_tests_properties(glm_dsa_forward_test_m346 PROPERTIES DEPENDS glm_dsa_forward_generate_m346)
+# The int4-attention candidate's fixture (attention projections at 4 bits in
+# the compressed-tensors contract, int8 shared expert): the same gates.
+set(GLM_DSA_ATTN4_FIXTURE ${CMAKE_BINARY_DIR}/glm_dsa_forward_fixture_attn4)
+add_test(NAME glm_dsa_forward_fixture_attn4 COMMAND glm_dsa_forward_test --write-fixture-attn4 ${GLM_DSA_ATTN4_FIXTURE})
+add_test(NAME glm_dsa_forward_smoke_attn4 COMMAND glm_dsa_forward_test --smoke ${GLM_DSA_ATTN4_FIXTURE})
+set_tests_properties(glm_dsa_forward_smoke_attn4 PROPERTIES DEPENDS glm_dsa_forward_fixture_attn4)
+# (No decode gate on this fixture: its random 4-bit attention leaves the
+# indexer at near-uniform logits, 10 of 13 decode rows flip their selection
+# and the kept rows sit downstream of the flips — the fixture lesson of
+# docs/glm53_plan.md; the 4-bit decode path is gated on the real weights by
+# the teacher-forced forward check under --attention-weights int4.)
+add_test(NAME glm_dsa_forward_generate_attn4
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/glm_dsa_reference_dump.py
+          gen-pure --checkpoint-dir ${GLM_DSA_ATTN4_FIXTURE}
+          --out ${CMAKE_CURRENT_BINARY_DIR}/glm_dsa_pure_ref_attn4.gdsdump)
+set_tests_properties(glm_dsa_forward_generate_attn4 PROPERTIES DEPENDS glm_dsa_forward_fixture_attn4)
+add_test(NAME glm_dsa_forward_test_attn4
+  COMMAND glm_dsa_forward_test --checkpoint-dir ${GLM_DSA_ATTN4_FIXTURE}
+          --dump-file ${CMAKE_CURRENT_BINARY_DIR}/glm_dsa_pure_ref_attn4.gdsdump)
+set_tests_properties(glm_dsa_forward_test_attn4 PROPERTIES DEPENDS glm_dsa_forward_generate_attn4)
 
 # The full GLM-5.3 TP forwards: loopback worlds 2 and 4 (ports 29952/29953).
 add_executable(glm_dsa_tp_test tests/cuda/glm_dsa_tp_test.cpp)

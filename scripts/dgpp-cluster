@@ -44,7 +44,7 @@ import time
 import tempfile
 from pathlib import Path
 
-from site_env import SITE_KEYS, config_argument, config_path, resolve_config, settings, run_paths, shell_prefix, release_name, site_paths
+from site_env import SITE_KEYS, config_argument, config_path, resolve_config, server_config, settings, run_paths, shell_prefix, release_name, site_paths
 import cluster_process
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -188,27 +188,47 @@ class Cluster:
         record = cluster_process.running(self.state_path)
         return record["pid"] if record else None
 
-    def wait_log(self, path, needle, timeout_s, label):
-        waited = 0
-        while waited < timeout_s:
+    def wait_log(self, path, needle, timeout_s, label, proc):
+        started = time.monotonic()
+        deadline = started + timeout_s
+        next_progress = started + 10
+        say(f"=== waiting for {label} (up to {timeout_s}s); rank 0 log: {path}")
+        while True:
+            # Reap the child as well as checking it: a zombie must never keep
+            # the launcher waiting, even if its log contains a ready marker.
+            returncode = proc.poll()
+            if returncode is not None:
+                say(f"FAILED waiting for {label}: rank 0 exited with status {returncode}; log: {path}")
+                self.tail(path, 10, width=None)
+                return False
+            contents = ""
             try:
                 with open(path, errors="replace") as f:
-                    if needle in f.read():
-                        say(f"{label}: ok ({waited}s)")
-                        return True
+                    contents = f.read()
             except OSError:
                 pass
-            time.sleep(2)
-            waited += 2
-        say(f"TIMEOUT waiting for {label} ({timeout_s}s)")
-        return False
+            now = time.monotonic()
+            elapsed = int(now - started)
+            if needle in contents:
+                say(f"{label}: ok ({elapsed}s)")
+                return True
+            if now >= deadline:
+                say(f"TIMEOUT waiting for {label} ({timeout_s}s); rank 0 log: {path}")
+                self.tail(path, 10, width=None)
+                return False
+            if now >= next_progress:
+                say(f"waiting for {label}: {elapsed}s elapsed; rank 0 pid {proc.pid} still running")
+                lines = contents.rstrip().splitlines()
+                say(f"latest rank 0 log: {lines[-1]}" if lines else "rank 0 has not written any log output yet")
+                next_progress = now + 10
+            time.sleep(min(2, deadline - now))
 
-    def tail(self, path, n):
+    def tail(self, path, n, width=200):
         try:
             with open(path, errors="replace") as f:
                 lines = f.read().splitlines()
             for line in lines[-n:]:
-                print("  " + line[:200])
+                print("  " + line[:width], flush=True)
         except OSError:
             pass
 
@@ -267,8 +287,11 @@ class Cluster:
         os.makedirs(self.log_dir, exist_ok=True)
         # Both head and peers receive the same resolved configuration. The
         # source deployment and .env are never rewritten or copied to peers.
+        # DGPP_NO_SWAP controls the launcher, not the engine. Older binaries
+        # reject unknown node_env keys, so keep this policy in the launch
+        # environment without changing the server's configuration schema.
         with tempfile.NamedTemporaryFile(mode="w", dir=self.log_dir, delete=False) as resolved:
-            json.dump(self.cfg, resolved, indent=2)
+            json.dump(server_config(self.cfg), resolved, indent=2)
             resolved.write("\n")
         os.replace(resolved.name, self.config_path)
         # The namespace is a hash of the deployment file's path; the scan
@@ -278,6 +301,7 @@ class Cluster:
         what = "the config" if self.installed else "dgpp-serve and the config"
         say(f"=== staging {what} to the peers" + (f" (release {self.release}: {self.bin})" if self.installed else ""))
         for rank, host in self.peers:
+            say(f"staging rank {rank} on {host}")
             # The stage dir may live in /tmp (a reboot empties it); a previous
             # run's op stream must never be hashed as this run's evidence.
             # Let find match the quoted pattern: zsh rejects unmatched shell
@@ -301,7 +325,8 @@ class Cluster:
         return True
 
     def boot_head(self):
-        say(f"=== rank 0 on {self.nodes[0]} (HTTP :{self.http}, fabric :{self.fabric}, journal :{self.journal})")
+        say(f"=== rank 0 on {self.nodes[0]} (HTTP {self.cfg['http']['bind_host']}:{self.http}, "
+            f"fabric :{self.fabric}, journal :{self.journal})")
         ops = os.path.join(self.log_dir, "serve_rank0.ops")
         if os.path.exists(ops):
             os.remove(ops)  # rank 0 streams its op stream into its cwd; never hash a stale one
@@ -351,6 +376,8 @@ class Cluster:
             return self._up()
 
     def _up(self):
+        say(f"=== starting {self.label}")
+        say("=== checking for existing rank processes")
         existing = self.head_pid() or any(self.remote_control("status", rank, host) for rank, host in self.peers)
         if existing:
             if not self.replace:
@@ -359,6 +386,7 @@ class Cluster:
                 return 1
         if not self.skip_preflight:
             import cluster_doctor
+            say("=== checking deployment readiness on all nodes")
             if cluster_doctor.check_cluster(self.cfg, self.bin, self.log_dir, self.stage_dir, self.user,
                                             self.peer_bin if self.installed else None):
                 return 1
@@ -379,14 +407,13 @@ class Cluster:
             raise
 
     def start_ranks(self):
-        self.boot_head()
+        proc = self.boot_head()
         r0 = os.path.join(self.log_dir, "serve_r0.log")
         # The journal star forms first: rank 0 listens on the journal at once
         # and pushes the settings to the peers before anyone builds a model;
         # the bus world forms after the builds (the peers' connect retries
         # within the rendezvous window).
-        if self.peers and not self.wait_log(r0, "journal: listening", 90, "journal listening"):
-            self.tail(r0, 5)
+        if self.peers and not self.wait_log(r0, "journal: listening", 90, "journal listening", proc):
             raise RuntimeError("rank 0 did not open the journal")
         if self.peers:
             say("=== peers " + " ".join(h for _, h in self.peers))
@@ -398,8 +425,7 @@ class Cluster:
             for rank, host in self.peers:
                 if not self.remote_control("status", rank, host):
                     say(f"WARN: peer rank {rank} not observed on {host}")
-        if not self.wait_log(r0, f"listening on :{self.http}", 600, "rank 0 serving"):
-            self.tail(r0, 10)
+        if not self.wait_log(r0, f"listening on :{self.http}", 600, "rank 0 serving", proc):
             raise RuntimeError("rank 0 did not become ready")
         bind = self.cfg["http"]["bind_host"]
         client_host = self.nodes[0] if bind == "0.0.0.0" else bind
@@ -648,7 +674,7 @@ def main():
                  f"from deploy/ (see deploy/README.md), copy it without .example in "
                  f"the filename, then pass its path with --config")
     if args.verb == "resolve":
-        print(json.dumps(resolve_config(args.config), indent=2))
+        print(json.dumps(server_config(resolve_config(args.config)), indent=2))
         return 0
     if args.verb == "paths":
         print(json.dumps(run_paths(args.config, log_dir=args.log_dir), indent=2))

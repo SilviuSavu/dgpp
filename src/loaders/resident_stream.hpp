@@ -415,7 +415,7 @@ void ResidentLayerStream<F>::check_resident_footprint_fits() const {
   if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) return;
   const size_t available = host_mem_available_bytes();
   constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
-  const size_t headroom = static_cast<size_t>(8 * kGiB);
+  const size_t headroom = static_cast<size_t>(4 * kGiB);  // the serving plan's figure (2026-10-09; see models/glm/loader.cpp)
   DGPP_LOG_INFO("{}: rank {} resident footprint {:.1f} GiB; device free {:.1f} of {:.1f} GiB, host "
                 "available {:.1f} GiB",
                 F::who(), rank_, footprint / kGiB, free_bytes / kGiB, total_bytes / kGiB,
@@ -424,7 +424,7 @@ void ResidentLayerStream<F>::check_resident_footprint_fits() const {
   if (footprint + headroom > free_bytes)
     throw std::runtime_error(
         std::string(F::who()) + ": the resident model (" + std::to_string(footprint >> 30) +
-        " GiB + 8 GiB headroom) does not fit in the device's free memory (" +
+        " GiB + 4 GiB headroom) does not fit in the device's free memory (" +
         std::to_string(free_bytes >> 30) +
         " GiB) — free memory on this node, use a larger world, or run in streaming residency");
 }

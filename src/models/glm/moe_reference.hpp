@@ -47,10 +47,33 @@ struct GlmMoeHostWeights {
   bool shared_packq = false;
   int packq_bits_routed = 4;
   int packq_bits_shared = 8;
-  int packq_scale_fmt = 0;  // every packed matrix's scale format (kPackedScale*)
+  int packq_scale_fmt = 0;  // every routed matrix's scale format (kPackedScale*; the shared triple: 0)
   std::vector<uint32_t> packq_words;
   std::vector<uint16_t> packq_scales;
   int packq_matrices(int n_experts) const { return (n_experts + (shared_packq ? 1 : 0)) * 3; }
+  // The Mixed346 contract (kMoeInputHadamard32Int8, 2026-10-09): per routed
+  // matrix its own width and scale format — [E * 3] entries, 3 / 4 / 6
+  // under kPackedScaleBf16G128Mixed346 or 4 under format 0 for an existing
+  // expert; empty = every routed matrix at packq_bits_routed /
+  // packq_scale_fmt. The words and scales are concatenated in matrix order
+  // at each matrix's own size either way.
+  std::vector<uint8_t> packq_matrix_bits;
+  std::vector<uint8_t> packq_matrix_fmt;
+  int packq_bits_of(int index, int n_experts) const {
+    if (index >= n_experts * 3) return packq_bits_shared;
+    return packq_matrix_bits.empty() ? packq_bits_routed : packq_matrix_bits[static_cast<size_t>(index)];
+  }
+  int packq_fmt_of(int index, int n_experts) const {
+    if (index >= n_experts * 3) return 0;
+    return packq_matrix_fmt.empty() ? packq_scale_fmt : packq_matrix_fmt[static_cast<size_t>(index)];
+  }
+  // The routed experts' input transform (kMoeInput*, moe.hpp): under
+  // kMoeInputHadamard32 the oracle rotates every routed projection's
+  // input by H32 (kernels/hadamard32.hpp) as the engine does; under
+  // kMoeInputHadamard32Int8 it rotates and quantizes it to the int8 codes
+  // (the represented values code x scale) for every format-3 expert, and
+  // feeds a format-0 (existing) expert the plain rows.
+  int routed_input_transform = 0;
 };
 
 // Expert payload layout inside GlmMoeHostWeights: expert e's matrix m at

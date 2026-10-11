@@ -13,6 +13,7 @@
 #include "common/log.hpp"
 #include "kernels/glm_moe_launch.hpp"
 #include "kernels/mma_gemv.hpp"
+#include "kernels/hadamard32.hpp"
 #include "kernels/moe_w4a4.hpp"
 #include "kernels/packq_gemm.hpp"
 #include "kernels/scale_gemm.hpp"
@@ -66,9 +67,16 @@ size_t GlmMoeLayer::scratch_bytes(const GlmMoeConfig& cfg, int max_tokens,
   dev += rows_total * I * 2 * 3;     // d_gate_, d_up_, d_act_
   dev += rows_total * H * 4;         // d_down_
   dev += M * H * 4;                  // d_acc_
+  if (cfg.routed_int8_activations) {
+    const size_t rows_h = std::max(rows_total, static_cast<size_t>(std::max(decode_slots, 0)));
+    const size_t rows_a = std::max(rows_total, static_cast<size_t>(std::max(decode_slots, 0)) * (K + 1));
+    dev += rows_h * H + rows_h * (H / 128) * 4;  // d_hidden_q_, d_hidden_qs_
+    dev += rows_a * I + rows_a * (I / 128) * 4;  // d_act_q_, d_act_qs_
+  }
   if (decode_slots > 0) {
     const size_t rows = static_cast<size_t>(decode_slots) * (K + 1);
     dev += rows * I * 2 + rows * H * 4 + rows * 4;
+    dev += static_cast<size_t>(decode_slots) * H * 2;  // d_hidden_rot_
     dev += static_cast<size_t>(decode_slots) * sizeof(int);
     if (cfg.shared_mma_aside) dev += static_cast<size_t>(decode_slots) * I * 2 * 3;
     dev += sizeof(MoeExpertView) * (E + 1) * 3;
@@ -169,6 +177,16 @@ GlmMoeLayer::GlmMoeLayer(const GlmMoeWeights& weights, const GlmMoeConfig& cfg,
   DGPP_CUDA_OK(cudaMalloc(&d_act_, rows_total * I * 2));
   DGPP_CUDA_OK(cudaMalloc(&d_down_, rows_total * H * sizeof(float)));
   DGPP_CUDA_OK(cudaMalloc(&d_acc_, M * H * sizeof(float)));
+  if (cfg_.routed_int8_activations) {
+    if (H % 128 != 0 || I % 128 != 0)
+      throw std::invalid_argument("GlmMoeLayer: the int8 activation codes need hidden and inter multiples of 128");
+    const size_t rows_h = std::max(rows_total, static_cast<size_t>(std::max(decode_slots_, 0)));
+    const size_t rows_a = std::max(rows_total, static_cast<size_t>(std::max(decode_slots_, 0)) * (cfg_.top_k + 1));
+    DGPP_CUDA_OK(cudaMalloc(&d_hidden_q_, rows_h * H));
+    DGPP_CUDA_OK(cudaMalloc(&d_hidden_qs_, rows_h * (H / 128) * sizeof(float)));
+    DGPP_CUDA_OK(cudaMalloc(&d_act_q_, rows_a * I));
+    DGPP_CUDA_OK(cudaMalloc(&d_act_qs_, rows_a * (I / 128) * sizeof(float)));
+  }
   h_counts_.assign(cfg_.n_experts, 0);
 
   // Decode-slot scratch: tokens*(top_k+1) rows — routed slots plus the
@@ -178,6 +196,7 @@ GlmMoeLayer::GlmMoeLayer(const GlmMoeWeights& weights, const GlmMoeConfig& cfg,
     const size_t rows =
         static_cast<size_t>(decode_slots_) * (cfg_.top_k + 1);
     DGPP_CUDA_OK(cudaMalloc(&d_slot_act_, rows * I * 2));
+    DGPP_CUDA_OK(cudaMalloc(&d_hidden_rot_, static_cast<size_t>(decode_slots_) * H * 2));
     DGPP_CUDA_OK(cudaMalloc(&d_slot_down_, rows * H * sizeof(float)));
     DGPP_CUDA_OK(cudaMalloc(&d_slot_order_, rows * sizeof(int32_t)));
     if (cfg_.shared_mma_aside) {
@@ -251,6 +270,11 @@ GlmMoeLayer::~GlmMoeLayer() {
   cudaFree(d_down_);
   cudaFree(d_acc_);
   cudaFree(d_slot_act_);
+  cudaFree(d_hidden_rot_);
+  cudaFree(d_hidden_q_);
+  cudaFree(d_hidden_qs_);
+  cudaFree(d_act_q_);
+  cudaFree(d_act_qs_);
   cudaFree(d_slot_down_);
   cudaFree(d_slot_order_);
   cudaFree(d_sh_gate_);
@@ -312,25 +336,56 @@ void GlmMoeLayer::route(const uint16_t* hidden, int tokens, cudaStream_t stream,
 
 void GlmMoeLayer::check_expert_geometry() const {
   const int H = cfg_.hidden, E = cfg_.n_experts;
+  if (w_.routed_input_transform != kMoeInputPlain && w_.routed_input_transform != kMoeInputHadamard32 &&
+      w_.routed_input_transform != kMoeInputHadamard32Int8)
+    throw std::runtime_error("GlmMoeLayer: unknown routed input transform");
+  if (w_.routed_hadamard32() && (H % 32 != 0))
+    throw std::runtime_error("GlmMoeLayer: the H32 input rotation needs hidden a multiple of 32");
+  const bool a8 = w_.routed_activation_int8();
+  if (a8 && (!w_.packq() || !cfg_.routed_int8_activations || d_hidden_q_ == nullptr))
+    throw std::runtime_error("GlmMoeLayer: int8 activation codes need packed experts and a layer built with routed_int8_activations");
   if (w_.packq()) {
     const GlmPackedMatrix& g0 = w_.experts_packed[0];
-    if (g0.bits != 4 && g0.bits != 8)
+    if (w_.routed_hadamard32() && g0.rows % 32 != 0)
+      throw std::runtime_error("GlmMoeLayer: the H32 input rotation needs the routed inter slice a multiple of 32");
+    if (a8 && (g0.rows % 128 != 0 || H % 128 != 0))
+      throw std::runtime_error("GlmMoeLayer: the int8 activation codes need hidden and the routed inter slice multiples of 128");
+    if (!a8 && g0.bits != 4 && g0.bits != 8)
       throw std::runtime_error("GlmMoeLayer: the packed routed width must be 4 or 8");
     for (int e = 0; e < E; ++e) {
       const GlmPackedMatrix* m = w_.experts_packed + static_cast<size_t>(e) * 3;
       if (m[0].cols != H || m[1].cols != H || m[0].rows != g0.rows ||
           m[1].rows != g0.rows || m[2].rows != H || m[2].cols != g0.rows ||
-          m[0].bits != g0.bits || m[1].bits != g0.bits || m[2].bits != g0.bits ||
-          m[0].scale_fmt != g0.scale_fmt || m[1].scale_fmt != g0.scale_fmt ||
-          m[2].scale_fmt != g0.scale_fmt ||
           !m[0].packed || !m[1].packed || !m[2].packed || !m[0].scales || !m[1].scales ||
           !m[2].scales)
         throw std::runtime_error(
             "GlmMoeLayer: inconsistent packed routed expert matrices (expert " +
             std::to_string(e) + ")");
+      if (a8) {
+        // The Mixed346 layer: an expert is a converted triple (format 3,
+        // gate and up at one width of 3 / 4 / 6, down at its own) or the
+        // baseline int4 g64 triple — the slot kernels' two paths.
+        const int f = m[0].scale_fmt;
+        if ((f != kPackedScaleBf16G128Mixed346 && f != kPackedScaleBf16G64) || m[1].scale_fmt != f ||
+            m[2].scale_fmt != f || !packed_bits_allowed(f, m[0].bits) || !packed_bits_allowed(f, m[2].bits) ||
+            m[0].bits != m[1].bits || (f == kPackedScaleBf16G64 && m[0].bits != 4) ||
+            (f == kPackedScaleBf16G64 && m[2].bits != 4))
+          throw std::runtime_error("GlmMoeLayer: a Mixed346 layer's expert " + std::to_string(e) +
+                                   " is neither a converted triple nor the baseline int4 one");
+      } else if (m[0].bits != g0.bits || m[1].bits != g0.bits || m[2].bits != g0.bits ||
+                 m[0].scale_fmt != g0.scale_fmt || m[1].scale_fmt != g0.scale_fmt ||
+                 m[2].scale_fmt != g0.scale_fmt) {
+        throw std::runtime_error(
+            "GlmMoeLayer: inconsistent packed routed expert matrices (expert " +
+            std::to_string(e) + ")");
+      }
     }
-    if (g0.scale_fmt != kPackedScaleBf16G64 && g0.scale_fmt != kPackedScaleF16G128)
+    if (!packed_scale_fmt_known(g0.scale_fmt))
       throw std::runtime_error("GlmMoeLayer: unknown packed routed scale format");
+    if (!a8 && packed_codebook(g0.scale_fmt) && g0.bits != 4)
+      throw std::runtime_error("GlmMoeLayer: the NF4I8 codebook routed experts are 4-bit");
+    if (!a8 && packed_mixed346(g0.scale_fmt))
+      throw std::runtime_error("GlmMoeLayer: Mixed346 triples need the int8 activation transform");
     if (has_shared()) {
       const GlmPackedMatrix* sh = w_.shared_packed;
       if (sh[0].rows != sh[1].rows || sh[2].cols != sh[0].rows || sh[2].rows != H ||
@@ -573,7 +628,10 @@ void GlmMoeLayer::upload_expert_views(MoeExpertView* d_dst, bool with_shared,
 bool GlmMoeLayer::packq_tile_list() const {
   // engine.expert_tile_list (default on; off keeps the max_rows grid).
   // Every wide form (variants 1-5) takes the tile list; the narrow kernel (0) keeps the max_rows grid.
-  return g_expert_tile_list && w_.packq() && w_.experts_packed[0].bits == 4 &&
+  // The int4 rows and the Mixed346 form (whose views carry each expert's
+  // width; the table's first expert may be any of them).
+  return g_expert_tile_list && w_.packq() &&
+         (w_.experts_packed[0].bits == 4 || w_.experts_packed[0].scale_fmt == kPackedScaleBf16G128Mixed346) &&
          (packq_gemm_variant_default() != 0 || g_prefill_fold_scales);
 }
 
@@ -841,6 +899,30 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
   const int routed_bits = packq ? w_.experts_packed[0].bits : 0;
   const int shared_bits = (packq && shared_seg) ? w_.shared_packed[0].bits : 0;
   const int routed_sf = packq ? w_.experts_packed[0].scale_fmt : 0;  // the shared triple: format 0
+  // The NF4I8 checkpoint's H32 rotation, once per row (kernels/hadamard32.cu):
+  // the tensor-core chain's routed gate / up read the token rows rotated
+  // into the gather buffer (unused by that chain otherwise; the row map is
+  // the same) while the shared segment reads the plain rows; the GEMV
+  // chain's gathered routed rows [0, tokens * top_k) are rotated in place
+  // after the gather (the shared segment's rows sit past them); the
+  // routed rows of the SwiGLU output are rotated in place before the down
+  // projection on both chains.
+  const bool rotate = packq && w_.routed_hadamard32();
+  const bool a8 = packq && w_.routed_activation_int8();
+  const bool rotate_mma = rotate && !a8 && kernel == MoeExpertKernel::kMma;
+  const uint16_t* routed_hidden = hidden;
+  if (rotate_mma) {
+    launch_hadamard32_rows(hidden, static_cast<size_t>(H), d_gather_, static_cast<size_t>(H), tokens, H,
+                           stream);
+    routed_hidden = d_gather_;
+  }
+  if (a8 && kernel == MoeExpertKernel::kMma && !hidden_codes_ready_)
+    // The Mixed346 tile kernel reads the token rows' int8 codes through
+    // the row map (and the plain rows for an existing expert's tiles) —
+    // quantized here unless the caller's fused norm already did.
+    launch_hadamard32_quant_int8_rows(hidden, static_cast<size_t>(H), d_hidden_q_, static_cast<size_t>(H),
+                                      d_hidden_qs_, static_cast<size_t>(H / 128), tokens, H, 0, stream);
+  hidden_codes_ready_ = false;
   const int fp4_group = fp4 ? w_.experts_fp4[0].scale_group : kFp4Group;
   const size_t I_max = static_cast<size_t>(std::max(I_r, I_s));
   const bool w4a4 = fp4 && !packq && fp4_group == kFp4Group && kernel == MoeExpertKernel::kMma &&
@@ -859,7 +941,7 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
   // OPT-IN, NOT BITWISE (engine.prefill_fold_scales): the wide kernel's
   // folded-scale form (variant 3) for every packed tensor-core launch of
   // this chain; -1 is the default variant (engine.expert_gemm).
-  const int packq_variant = g_prefill_fold_scales && routed_bits == 4 ? 3 : -1;
+  const int packq_variant = g_prefill_fold_scales && routed_bits == 4 && !a8 ? 3 : -1;
   down_bf16_ = (w4a4 || packq_mma_bf16_down) && shared_seg == nullptr && !f32_down;
   if (w4a4) {
     static const bool logged = [&] {
@@ -893,9 +975,20 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
   // The GEMV core reads a gathered copy of the rows; the tensor-core kernel
   // reads the hidden rows through the row map directly (2026-09-05: the
   // gather was 1.26 ms per layer at 2048 tokens).
-  if (!mma)
+  if (!mma) {
     launch_moe_gather_rows(hidden, d_rows_, d_gather_, static_cast<int>(rows_total),
                            H, stream);
+    if (a8 && rows_total > static_cast<size_t>(tokens))
+      // The Mixed346 layer: the routed rows' int8 codes and scales beside
+      // the plain gathered rows (an existing expert's and the shared
+      // segment's input), kernels/hadamard32.cu.
+      launch_hadamard32_quant_int8_rows(d_gather_, static_cast<size_t>(H), d_hidden_q_, static_cast<size_t>(H),
+                                        d_hidden_qs_, static_cast<size_t>(H / 128),
+                                        static_cast<int>(rows_total - tokens), H, 0, stream);
+    else if (rotate && rows_total > static_cast<size_t>(tokens))
+      launch_hadamard32_rows(d_gather_, static_cast<size_t>(H), d_gather_, static_cast<size_t>(H),
+                             static_cast<int>(rows_total - tokens), H, stream);
+  }
   // `routed` selects the routed experts' kernel family: the fp4 kernels
   // (tensor-core or GEMV) for NVFP4 tables, the fp8 ones otherwise; the
   // shared segment (FP8 under both formats) always takes the fp8 kernels.
@@ -908,11 +1001,20 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
   auto gemm_bf16 = [&](const MoeSegment* sg, int ns, int mr, int split, int which,
                        uint16_t* out, int n, bool routed_arg) {
     const bool routed = routed_arg || shared_fp4;
-    if (packq && mma)
-      launch_moe_grouped_mma_packq_bf16(hidden, H, sg, ns, mr, views, which, out, I_max,
-                                        n, H, routed_arg ? routed_bits : shared_bits, stream,
-                                        d_rows_, routed_arg ? routed_sf : 0, packq_variant,
+    if (packq && mma && a8 && routed_arg)
+      launch_moe_grouped_mma_packq_bf16(hidden, H, sg, ns, mr, views, which, out, I_max, n, H, 0, stream,
+                                        d_rows_, kPackedScaleBf16G128Mixed346, packq_variant, tiles, tile_count,
+                                        tile_cap, nullptr, -1, d_hidden_q_, static_cast<size_t>(H), d_hidden_qs_,
+                                        static_cast<size_t>(H / 128));
+    else if (packq && mma)
+      launch_moe_grouped_mma_packq_bf16(routed_arg ? routed_hidden : hidden, H, sg, ns, mr, views,
+                                        which, out, I_max, n, H, routed_arg ? routed_bits : shared_bits,
+                                        stream, d_rows_, routed_arg ? routed_sf : 0, packq_variant,
                                         routed_arg ? tiles : nullptr, tile_count, tile_cap);
+    else if (a8 && routed_arg)
+      launch_moe_grouped_gemv_m346_bf16(d_gather_, H, d_hidden_q_, static_cast<size_t>(H), d_hidden_qs_,
+                                        static_cast<size_t>(H / 128), sg, ns, mr, split, views, which,
+                                        out, I_max, n, H, stream);
     else if (packq)
       launch_moe_grouped_gemv_packq_bf16(d_gather_, H, sg, ns, mr, split, views,
                                          which, out, I_max, n, H,
@@ -937,7 +1039,16 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
   auto gemm_f32 = [&](const MoeSegment* sg, int ns, int mr, int split, int k,
                       bool routed_arg) {
     const bool routed = routed_arg || shared_fp4;
-    if (packq && mma && down_bf16_)
+    if (packq && mma && a8 && routed_arg && down_bf16_)
+      launch_moe_grouped_mma_packq_bf16(d_act_, I_max, sg, ns, mr, views, 2,
+                                        reinterpret_cast<uint16_t*>(d_down_), H, H, k, 0, stream, nullptr,
+                                        kPackedScaleBf16G128Mixed346, packq_variant, tiles, tile_count, tile_cap,
+                                        nullptr, -1, d_act_q_, I_max, d_act_qs_, I_max / 128);
+    else if (packq && mma && a8 && routed_arg)
+      launch_moe_grouped_mma_packq_f32(d_act_, I_max, sg, ns, mr, views, 2, d_down_, H, H, k, 0, stream,
+                                       nullptr, kPackedScaleBf16G128Mixed346, packq_variant, tiles, tile_count,
+                                       tile_cap, d_act_q_, I_max, d_act_qs_, I_max / 128);
+    else if (packq && mma && down_bf16_)
       launch_moe_grouped_mma_packq_bf16(d_act_, I_max, sg, ns, mr, views, 2,
                                         reinterpret_cast<uint16_t*>(d_down_), H, H, k,
                                         routed_arg ? routed_bits : shared_bits, stream, nullptr,
@@ -948,6 +1059,9 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
                                        H, k, routed_arg ? routed_bits : shared_bits, stream,
                                        nullptr, routed_arg ? routed_sf : 0, packq_variant,
                                        routed_arg ? tiles : nullptr, tile_count, tile_cap);
+    else if (a8 && routed_arg)
+      launch_moe_grouped_gemv_m346_f32(d_act_, I_max, d_act_q_, I_max, d_act_qs_, I_max / 128, sg, ns, mr, split,
+                                       d_views_prefill_, 2, d_down_, H, H, k, stream);
     else if (packq)
       launch_moe_grouped_gemv_packq_f32(d_act_, I_max, sg, ns, mr, split, views,
                                         2, d_down_, H, H, k,
@@ -976,11 +1090,11 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
   // token row gathered once for both): engine.expert_gemm_pair. Off by
   // default (2026-09-30, session P: level to +1 % on the fabric against
   // two launches — the activation re-gather is not what bounds the kernel).
-  const bool paired = packq && mma && g_expert_gemm_pair && routed_bits == 4;
+  const bool paired = packq && mma && g_expert_gemm_pair && routed_bits == 4 && !a8;
   if (paired)
-    launch_moe_grouped_mma_packq_bf16(hidden, H, segs, n_segs, max_rows, views, 0, d_gate_, I_max,
-                                      I_r, H, routed_bits, stream, d_rows_, routed_sf, packq_variant, tiles,
-                                      tile_count, tile_cap, d_up_, 1);
+    launch_moe_grouped_mma_packq_bf16(routed_hidden, H, segs, n_segs, max_rows, views, 0, d_gate_,
+                                      I_max, I_r, H, routed_bits, stream, d_rows_, routed_sf, packq_variant,
+                                      tiles, tile_count, tile_cap, d_up_, 1);
   else
     gemm_bf16(segs, n_segs, max_rows, 0, 0, d_gate_, I_r, true);
   if (shared_seg) gemm_bf16(shared_seg, 1, tokens, shared_split, 0, d_gate_, I_s, false);
@@ -1005,6 +1119,16 @@ void GlmMoeLayer::grouped_expert_chain(MoeExpertKernel kernel,
     launch_moe_swiglu_clamp(d_gate_, d_up_, d_act_,
                             static_cast<int64_t>(rows_total) * I_max,
                             cfg_.swiglu_limit, stream);
+    // The routed rows [0, tokens * top_k) of the SwiGLU output rotated in
+    // place for the down projection; the shared rows past them stay. The
+    // Mixed346 layer quantizes them into the code / scale copies instead
+    // (the bf16 rows stay plain for an existing expert).
+    if (a8 && rows_total > static_cast<size_t>(tokens))
+      launch_hadamard32_quant_int8_rows(d_act_, I_max, d_act_q_, I_max, d_act_qs_, I_max / 128,
+                                        static_cast<int>(rows_total - tokens), I_r, 0, stream);
+    else if (rotate && rows_total > static_cast<size_t>(tokens))
+      launch_hadamard32_rows(d_act_, I_max, d_act_, I_max, static_cast<int>(rows_total - tokens), I_r,
+                             stream);
     if (w4a4)
       launch_quantize_rows_nvfp4(d_act_, I_max, static_cast<int>(rows_total), I_r, d_q_codes_, d_q_scales_, d_q_gs_,
                                  stream, 0.f, moe_w4a4_static() && w_.act_scales_dev ? w_.act_scales_dev + 1 : nullptr);
@@ -1292,11 +1416,45 @@ void GlmMoeLayer::enqueue_decode_impl(const uint16_t* hidden, uint16_t* out_bf16
     const int rsf = w_.experts_packed[0].scale_fmt;
     const int sb = slot_shared ? w_.shared_packed[0].bits : 0;
     const int sbase = slot_shared ? E * 3 : -1;
+    // The NF4I8 checkpoint's H32 rotation (kernels/hadamard32.cu), once
+    // per token row: the routed slots stage the rotated rows (the shared
+    // slot the plain ones), and the routed slots' SwiGLU rows are rotated
+    // in place before the down projection (slot t * (K + 1) + K, the
+    // shared one, skipped) — not per block inside the slot kernels, whose
+    // 64 blocks a slot would each repeat the row's rotation.
+    const bool rot = w_.routed_hadamard32();
+    if (w_.routed_activation_int8()) {
+      // The Mixed346 layer (kernels/hadamard32.cu): the token rows rotated
+      // and quantized once per step into the code / scale copies the
+      // converted experts' slots read (the shared slot and an existing
+      // expert's slots read `hidden`); the SwiGLU rows likewise before the
+      // down projection, the shared slot's row (t * (K + 1) + K) skipped
+      // and every bf16 row kept as written.
+      if (!hidden_codes_ready_)
+        launch_hadamard32_quant_int8_rows(hidden, static_cast<size_t>(H), d_hidden_q_, static_cast<size_t>(H),
+                                          d_hidden_qs_, static_cast<size_t>(H / 128), tokens, H, 0, stream);
+      hidden_codes_ready_ = false;
+      launch_moe_slot_gate_up_swiglu_m346(hidden, H, d_hidden_q_, static_cast<size_t>(H), d_hidden_qs_,
+                                          static_cast<size_t>(H / 128), d_ids_, order, table, I_r, H, I_s,
+                                          d_slot_act_, I_r, slots, K, cfg_.swiglu_limit, stream, sbase);
+      launch_hadamard32_quant_int8_rows(d_slot_act_, static_cast<size_t>(I_r), d_act_q_, static_cast<size_t>(I_r),
+                                        d_act_qs_, static_cast<size_t>(I_r / 128), slots, I_r, K + 1, stream);
+      launch_moe_slot_down_m346(d_slot_act_, I_r, d_act_q_, static_cast<size_t>(I_r), d_act_qs_,
+                                static_cast<size_t>(I_r / 128), d_ids_, order, table, H, I_r, N_s, d_slot_down_, H,
+                                slots, K, stream, sbase);
+    } else {
+    if (rot)
+      launch_hadamard32_rows(hidden, static_cast<size_t>(H), d_hidden_rot_, static_cast<size_t>(H),
+                             tokens, H, stream);
     launch_moe_slot_gate_up_swiglu_packq(hidden, H, d_ids_, order, table, I_r, H, rb, I_s, sb,
                                          d_slot_act_, I_r, slots, K, cfg_.swiglu_limit, stream,
-                                         sbase, rsf);
+                                         sbase, rsf, rot ? d_hidden_rot_ : nullptr);
+    if (rot)
+      launch_hadamard32_rows_skip(d_slot_act_, static_cast<size_t>(I_r), d_slot_act_,
+                                  static_cast<size_t>(I_r), slots, I_r, K + 1, stream);
     launch_moe_slot_down_packq(d_slot_act_, I_r, d_ids_, order, table, H, I_r, rb, N_s, sb,
                                d_slot_down_, H, slots, K, stream, sbase, rsf);
+    }
   } else if (fp4) {
     const int fp4_group = w_.experts_fp4[0].scale_group;
     launch_moe_slot_gate_up_swiglu_fp4(

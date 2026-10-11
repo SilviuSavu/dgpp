@@ -158,7 +158,7 @@ struct ServeKnobs {
   dgpp::serve::FileInputConfig file_inputs;
   int world = 1;  // dgpp_build_info's world_size
   uint16_t http_port = 8080;
-  std::string http_bind = "127.0.0.1";
+  std::string http_bind = "0.0.0.0";
   int64_t http_max_body_bytes = dgpp::serve::kDefaultHttpMaxBodyBytes;
   int sse_ping_interval = dgpp::serve::kDefaultSsePingInterval;
   int max_connections = 64;
@@ -1388,7 +1388,7 @@ int main(int argc, char** argv) {
       "    the world (the node list), this rank's peer, the ports and every\n"
       "    engine knob below; flags given after it override\n"
       "  [--port N (default 18080; rank 0 only)]\n"
-      "  [--bind-host IPV4 (default 127.0.0.1; rank 0 only)]\n"
+      "  [--bind-host IPV4 (default 0.0.0.0; rank 0 only)]\n"
       "  [--metrics-port N (default 0 = off; ranks > 0 only)]: the peer's\n"
       "    dgpp_rank_* metrics listener (GET /metrics/prometheus); config ports.metrics\n"
       "  [--metrics-bind HOST (default: this rank's node address; resolves to IPv4; ranks > 0 only)]\n"
@@ -1537,6 +1537,8 @@ int main(int argc, char** argv) {
   // table, the default and the behaviour every earlier build had.
   std::optional<dgpp::RopeScaling> rope_scaling;
   std::string embed_sharding = "replicated";  // the full GLM-5.3's embedding: replicated | vocab
+  std::string mtp_head = "checkpoint";        // the full GLM-5.3 draft head: checkpoint | fp8
+  std::string attention_weights = "checkpoint";  // the full GLM-5.3 attention projections: checkpoint | int4
   int max_concurrency = 8, queue_limit = 64, default_max_tokens = 256, admission_gather_ms = 3;
   dgpp::serve::FileInputConfig file_inputs;
   bool compact_batches = false;
@@ -1593,7 +1595,7 @@ int main(int argc, char** argv) {
   // The cluster config: found first, whatever its position,
   // because the flags after it override what it sets.
   std::string config_path;
-  std::string http_bind = "127.0.0.1";
+  std::string http_bind = "0.0.0.0";
   int config_rank = 0;
   bool memory_plan_only = false;  // --memory-plan: the check alone, then exit
   for (int i = 1; i + 1 < argc; ++i) {
@@ -1652,6 +1654,8 @@ int main(int argc, char** argv) {
     prefill = e.prefill;
     rope_scaling = e.rope_scaling;
     embed_sharding = e.embed_sharding;
+    mtp_head = e.mtp_head;
+    attention_weights = e.attention_weights;
     default_max_tokens = e.default_max_tokens;
     file_inputs = e.file_inputs;
     queue_limit = e.queue_limit;
@@ -1763,6 +1767,8 @@ int main(int argc, char** argv) {
     else if (a == "--no-ngram-prestage") ngram_prestage = false;
     else if (a == "--prefill") prefill = next();
     else if (a == "--embed-sharding") embed_sharding = next();
+    else if (a == "--mtp-head") mtp_head = next();
+    else if (a == "--attention-weights") attention_weights = next();
     else if (a == "--memory-plan") memory_plan_only = true;
     else if (a == "--max-concurrency") max_concurrency = std::stoi(next());
     else if (a == "--queue-limit") queue_limit = std::stoi(next());
@@ -1970,7 +1976,7 @@ int main(int argc, char** argv) {
         graph_batch_min_live == 0 ? std::min(2, max_concurrency) : graph_batch_min_live;
     return std::format(
         "model={} world={} fabric={} journal={} conc={} kv={} kvdt={} ngt={} dw={} mtpef={} bfw={} "
-        "fp8head={} pf={} "
+        "fp8head={} mtph={} attw={} pf={} "
         "emsh={} maxtok={} queue={} "
         "eos={} graph={} compact={} mtp={} mtpd={} mss={} msrow={} msbase={} mslam={} msmin={} "
         "msad={} msss={} mdr={} mdt={} mvf={} dbr={} "
@@ -1979,8 +1985,8 @@ int main(int argc, char** argv) {
         "reasoning_in_content={} "
         "rs={} dflash={} dfw={} nvme={}",
         model_id.empty() ? ckpt : model_id, world, fabric_port, journal_port, max_concurrency,
-        kv_capacity, kv_dtype, ngram_table, dense_weights, mtp_expert_format, bf16_weights, fp8_head, prefill,
-        embed_sharding, default_max_tokens, queue_limit, no_eos ? 0 : 1, decode_graph ? 1 : 0,
+        kv_capacity, kv_dtype, ngram_table, dense_weights, mtp_expert_format, bf16_weights, fp8_head, mtp_head,
+        attention_weights, prefill, embed_sharding, default_max_tokens, queue_limit, no_eos ? 0 : 1, decode_graph ? 1 : 0,
         compact_batches ? 1 : 0, mtp ? 1 : 0, mtp_depth, mtp_schedule ? 1 : 0, mtp_schedule_row_ms,
         mtp_schedule_base_ms, mtp_schedule_lambda, mtp_schedule_min_depth,
         mtp_schedule_adapt ? 1 : 0, mtp_schedule_sampled_scale, mtp_draft, mtp_draft_temperature,
@@ -2051,6 +2057,8 @@ int main(int argc, char** argv) {
         ws.prefill = prefill;
         ws.rope_scaling = rope_scaling;
         ws.embed_sharding = embed_sharding;
+        ws.mtp_head = mtp_head;
+        ws.attention_weights = attention_weights;
         ws.default_max_tokens = default_max_tokens;
         ws.queue_limit = queue_limit;
         ws.no_eos = no_eos;
@@ -2138,6 +2146,8 @@ int main(int argc, char** argv) {
         prefill = ws.prefill;
         rope_scaling = ws.rope_scaling;
         embed_sharding = ws.embed_sharding;
+        mtp_head = ws.mtp_head;
+        attention_weights = ws.attention_weights;
         default_max_tokens = ws.default_max_tokens;
         queue_limit = ws.queue_limit;
         no_eos = ws.no_eos;
@@ -2366,6 +2376,18 @@ int main(int argc, char** argv) {
   dgpp::GlmDsaLayerStream::set_embed_vocab_sharded(embed_sharding == "vocab");
   dgpp::Dsv41LayerStream::set_embed_vocab_sharded(embed_sharding == "vocab");
   dgpp::Dsv4LayerStream::set_embed_vocab_sharded(embed_sharding == "vocab");
+  if (mtp_head != "checkpoint" && mtp_head != "fp8") {
+    DGPP_LOG_ERROR("--mtp-head must be checkpoint or fp8, got '{}'", mtp_head);
+    return 2;
+  }
+  // The full GLM-5.3 draft head's form: set before the plan and the load
+  // (the loader encodes the FP8 copy beside the head's rows).
+  dgpp::GlmDsaLayerStream::set_mtp_head_fp8(mtp_head == "fp8");
+  if (attention_weights != "checkpoint" && attention_weights != "int4") {
+    DGPP_LOG_ERROR("--attention-weights must be checkpoint or int4, got '{}'", attention_weights);
+    return 2;
+  }
+  dgpp::GlmDsaLayerStream::set_attention_weights_int4(attention_weights == "int4");
   if (world > 1) {
     require(rank >= 0 && rank < world, "--rank outside --world");
     require(!peer.empty() || rank == 0,
@@ -2551,6 +2573,8 @@ int main(int argc, char** argv) {
           family->name());
       return 1;
     }
+    if (mtp_head == "fp8" && std::string(family->name()) != "glm_moe_dsa")
+      DGPP_LOG_WARN("engine.mtp_head = fp8 applies to the full GLM-5.3's draft block; {} ignores it", family->name());
     if (embed_sharding == "vocab" && std::string(family->name()) != "glm_moe_dsa" &&
         std::string(family->name()) != "deepseek_v41" && std::string(family->name()) != "deepseek_v4")
       DGPP_LOG_WARN("engine.embed_sharding = vocab applies to the full GLM-5.3 and the DeepSeek families; {} keeps its "

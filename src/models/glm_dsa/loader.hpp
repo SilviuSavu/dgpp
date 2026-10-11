@@ -19,9 +19,10 @@
 //   dense MLP: BF16 gate/up rows and down columns at 12288/W.
 //   MoE:       router and its bias replicated; every routed expert and the
 //              shared expert sliced on the intermediate dim at 2048/W
-//              (gate/up rows, down columns on a 64-group boundary): int4
-//              and int8 triples on the packed layers, requantized from the
-//              draft's BF16 (routed int4, shared int8).
+//              (gate/up rows, down columns on a group boundary — 64, or
+//              128 for the NF4I8 codebook experts): int4 / codebook and
+//              int8 triples on the packed layers, requantized from the
+//              draft's BF16 (routed int4 g64, shared int8).
 //   draft:     as a main layer; enorm/hnorm/eh_proj/shared_head.norm
 //              replicated.
 //   globals:   embed replicated (a row gather), the final norm, lm_head
@@ -114,6 +115,10 @@ struct GlmDsaGlobalsResident {
   int embed_vocab_count = 0;             // rows held (the vocabulary unless vocab-sharded)
   const uint16_t* final_norm = nullptr;  // BF16 [hidden]
   const uint16_t* lm_head = nullptr;     // BF16 [lm_vocab_count, hidden]
+  // The draft block's head under GlmDsaLayerStream::mtp_head_fp8(): the
+  // same rows in block FP8 (e4m3 codes, 128 x 128 fp32 scales), encoded at
+  // load from the BF16 rows; payload == nullptr otherwise.
+  GlmQuantMatrix lm_head_fp8;
   int lm_vocab_begin = 0;
   int lm_vocab_count = 0;
   size_t bytes = 0;
@@ -138,6 +143,10 @@ struct GlmDsaLocalGeometry {
 };
 
 // The family behind the shared stream (loaders/resident_stream.hpp).
+// The load-time form (GlmDsaLayerStream's process-wide setting), readable
+// before the class is declared.
+bool glm_dsa_attention_weights_int4();
+
 struct GlmDsaLoaderFamily {
   using Config = GlmDsaTextConfig;
   using Expected = GlmDsaExpectedTensor;
@@ -147,7 +156,13 @@ struct GlmDsaLoaderFamily {
   using PresentMap = std::unordered_map<std::string, GlmDsaTensorDesc>;
   struct Builder;  // models/glm_dsa/loader.cpp
   static const char* who() { return "glm_dsa loader"; }
-  static uint64_t loader_format() { return 1; }
+  // The resident image's key folds this in: a load-time form that changes
+  // a layer's bytes (engine.attention_weights) selects its own images
+  // (2026-10-09; an image built under another form is not the stale-image
+  // error, it is another image).
+  static uint64_t loader_format() {
+    return 1u | (glm_dsa_attention_weights_int4() ? 4u : 0u);
+  }
   static int max_layer(const Config& c) { return c.num_hidden_layers + (c.mtp_layer() >= 0 ? 1 : 0); }
   static int main_layers(const Config& c) { return c.num_hidden_layers; }
   static std::vector<Expected> layer_table(const Config& c, int layer) {
@@ -185,6 +200,19 @@ class GlmDsaLayerStream : public ResidentLayerStream<GlmDsaLoaderFamily> {
   // Process-wide like the Qwen knobs; set before the plan and the load.
   static void set_embed_vocab_sharded(bool on);
   static bool embed_vocab_sharded();
+  // The deployment's `engine.mtp_head` ("fp8": the draft block reads a
+  // block-FP8 copy of the lm head encoded at load, +0.23 GiB per rank at
+  // world 4; the main step's head is untouched). Set before the plan and
+  // the load.
+  static void set_mtp_head_fp8(bool on);
+  static bool mtp_head_fp8();
+  // The deployment's `engine.attention_weights` ("int4": the packed layers'
+  // q_a/kv_a, q_b and o_proj re-encoded from the checkpoint's int8 g64 to
+  // int4 g64 at load with the RTN recipe — half their bytes a token, a
+  // quality cost the teacher-forced gate measures; the checkpoint's own
+  // form otherwise). Set before the plan and the load.
+  static void set_attention_weights_int4(bool on);
+  static bool attention_weights_int4();
 
  protected:
   const std::string& image_dir() const override { return resident_image_dir(); }

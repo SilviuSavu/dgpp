@@ -227,6 +227,19 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
   const dgpp::serve::ClusterConfig both = dgpp::serve::parse_cluster_config(
       R"({"model":"m","nodes":["h"],"engine":{"bf16_weights":"bf12+bf16"}})", "t");
   require(both.engine.bf16_weights == "bf12+bf16", "bf16_weights bf12+bf16");
+  // The full GLM-5.3 draft head's form: named by the config, the checkpoint's by default.
+  require(bf12.engine.mtp_head == "checkpoint", "mtp_head defaults to checkpoint");
+  const dgpp::serve::ClusterConfig mtph = dgpp::serve::parse_cluster_config(
+      R"({"model":"m","nodes":["h"],"engine":{"mtp_head":"fp8"}})", "t");
+  require(mtph.engine.mtp_head == "fp8", "mtp_head fp8");
+  require(!refusal(R"({"model":"m","nodes":["h"],"engine":{"mtp_head":"int8"}})").empty(),
+          "mtp_head refuses an unknown form");
+  require(bf12.engine.attention_weights == "checkpoint", "attention_weights defaults to checkpoint");
+  const dgpp::serve::ClusterConfig attw = dgpp::serve::parse_cluster_config(
+      R"({"model":"m","nodes":["h"],"engine":{"attention_weights":"int4"}})", "t");
+  require(attw.engine.attention_weights == "int4", "attention_weights int4");
+  require(!refusal(R"({"model":"m","nodes":["h"],"engine":{"attention_weights":"fp8"}})").empty(),
+          "attention_weights refuses an unknown form");
   require(c.paths.log_dir == "/var/log/dgpp" && c.paths.stage_dir == "/tmp/bus4" &&
               c.paths.release_dir == "~/dgpp/releases" && c.paths.resident_cache.empty(),
           "the paths: given one taken, the rest defaulted");
@@ -234,7 +247,7 @@ DGPP_TEST(cluster_config_parses_fills_defaults_and_derives_the_world) {
   const dgpp::serve::ClusterConfig one =
       dgpp::serve::parse_cluster_config(R"({"model":"m","nodes":["h"]})", "t");
   require(one.world() == 1 && one.http_port == 18080, "a one-node world");
-  require(one.http_bind == "127.0.0.1", "HTTP defaults to loopback");
+  require(one.http_bind == "0.0.0.0", "HTTP defaults to all IPv4 interfaces");
   require(one.http_max_body_bytes == 256ll * 1024 * 1024, "HTTP body default supports large prefills");
 }
 
@@ -294,6 +307,9 @@ DGPP_TEST(cluster_config_http_override_is_order_independent) {
   require(c.http_bind == "0.0.0.0" && c.http_port == 8080, "deployment HTTP wins over legacy ports");
   require(c.http_max_body_bytes == 5368709120ll, "body limit retains a 64-bit byte count");
   require(c.node_env.at(0).at("HF_HUB_CACHE") == "~/cache", "node cache retained");
+  const auto local = dgpp::serve::parse_cluster_config(
+      R"({"model":"m","nodes":["h"],"http":{"bind_host":"127.0.0.1"}})", "t");
+  require(local.http_bind == "127.0.0.1", "explicit loopback binding is preserved");
   require(!refusal(R"({"model":"m","nodes":["h"],"http":{"bind_host":"localhost"}})").empty(), "bind must be IPv4");
   require(!refusal(R"({"model":"m","nodes":["h"],"node_env":[{"HF_TOKEN":"x"}]})").empty(), "credentials disallowed");
 }

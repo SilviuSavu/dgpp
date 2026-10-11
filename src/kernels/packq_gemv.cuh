@@ -53,6 +53,14 @@
 //   kScaleF16G128 (1): one IEEE f16 scale per 128 codes (GPTQ / AutoRound
 //     int4 g128 and int8 g128: the Qwen3.8 AutoRound hybrid). The
 //     checkpoint's scales untouched; f16 -> fp32 is exact.
+//   kScaleBf16G128Nf4i8 (2, 2026-10-08): one bf16 scale per 128 codes AND
+//     a different code meaning — the 4-bit code is an index into the fixed
+//     16-level int8 codebook kNf4i8Codebook (models/quant_matrix.hpp;
+//     HawkBearPig/GLM-5.3-NF4I8-GPTQ-H32-g128). The level replaces the
+//     offset code in the chain above (an 8-bit integer times a bf16: still
+//     exact in fp32) and nothing else moves; the lookup is two byte
+//     permutes per four codes (expand_nf4_int8), no memory. 4-bit only;
+//     compiled at the routed expert widths (sf_compiled).
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -62,6 +70,7 @@
 
 #include "common/dtypes.hpp"
 #include "kernels/gemv_common.cuh"
+#include "models/quant_matrix.hpp"
 
 namespace dgpp {
 namespace packq_gemv {
@@ -78,33 +87,70 @@ constexpr int kMaxChunksPerLane = 4;              // chunks in flight per lane p
 constexpr int kSteps = 1;                         // row steps per warp
 constexpr int kMaxPasses = 8;                     // chunk passes per lane
 
-constexpr int kScaleBf16G64 = 0;
-constexpr int kScaleF16G128 = 1;
+constexpr int kScaleBf16G64 = kPackedScaleBf16G64;
+constexpr int kScaleF16G128 = kPackedScaleF16G128;
+constexpr int kScaleBf16G128Nf4i8 = kPackedScaleBf16G128Nf4i8;
 template <int SF>
 struct ScaleFmt;
 template <>
 struct ScaleFmt<kScaleBf16G64> {
   static constexpr int group = 64;
+  static constexpr bool codebook = false;
   __device__ __forceinline__ static float to_float(uint16_t b) { return bf16_bits_to_float(b); }
 };
 template <>
 struct ScaleFmt<kScaleF16G128> {
   static constexpr int group = 128;
+  static constexpr bool codebook = false;
   __device__ __forceinline__ static float to_float(uint16_t b) {
     return __half2float(__ushort_as_half(b));
   }
 };
+template <>
+struct ScaleFmt<kScaleBf16G128Nf4i8> {
+  static constexpr int group = 128;
+  static constexpr bool codebook = true;
+  __device__ __forceinline__ static float to_float(uint16_t b) { return bf16_bits_to_float(b); }
+};
+// The Mixed346 format (kPackedScaleBf16G128Mixed346, 2026-10-09): bf16
+// scales per 128 and codebook indices of 3, 4 or 6 bits — the tensor-core
+// kernel's (packq_gemm.cu) and the Mixed346 core's (packq_a8_gemv.cuh)
+// form; this core's chunk geometry does not take it (scale_fmt_known).
+constexpr int kScaleBf16G128Mixed346 = kPackedScaleBf16G128Mixed346;
+template <>
+struct ScaleFmt<kScaleBf16G128Mixed346> {
+  static constexpr int group = 128;
+  static constexpr bool codebook = true;
+  __device__ __forceinline__ static float to_float(uint16_t b) { return bf16_bits_to_float(b); }
+};
 __host__ __device__ constexpr int scale_group_of(int sf) {
-  return sf == kScaleF16G128 ? 128 : 64;
+  return sf == kScaleBf16G64 ? 64 : 128;
 }
 __host__ __device__ constexpr bool scale_fmt_known(int sf) {
-  return sf == kScaleBf16G64 || sf == kScaleF16G128;
+  return sf == kScaleBf16G64 || sf == kScaleF16G128 || sf == kScaleBf16G128Nf4i8;
+}
+__host__ __device__ constexpr bool scale_fmt_codebook(int sf) { return sf == kScaleBf16G128Nf4i8; }
+
+// Four 4-bit NF4I8 indices (the low 16 bits of `x`, nibble j = code j) to
+// four signed int8 codebook levels, byte j = level j, with two byte
+// permutes (PRMT) per table half and a sign-bit select: selector nibble
+// j & 7 picks the level from the eight bytes of {hi_table : lo_table},
+// and the index's bit 3 (moved to the selector's byte-4 position) picks
+// which half. The tables are kNf4i8Codebook as bytes, little-endian:
+// 0x81 0xA8 0xBD 0xCE | 0xDC 0xE9 0xF4 0x00 (levels 0..7) and 0x0A 0x14
+// 0x1F 0x2B | 0x38 0x47 0x5C 0x7F (levels 8..15).
+__device__ __forceinline__ uint32_t expand_nf4_int8(uint32_t x) {
+  const uint32_t lo = __byte_perm(0xCEBDA881u, 0x00F4E9DCu, x & 0x7777u);
+  const uint32_t hi = __byte_perm(0x2B1F140Au, 0x7F5C4738u, x & 0x7777u);
+  const uint32_t sel = __byte_perm(0u, 0xFFFFFFFFu, (x & 0x8888u) >> 1);
+  return (lo & ~sel) | (hi & sel);
 }
 
 template <int Bits, int SF = kScaleBf16G64>
 struct Fmt {
   static_assert(Bits == 4 || Bits == 8, "packq_gemv: 4- or 8-bit codes");
   static_assert(scale_fmt_known(SF), "packq_gemv: unknown scale format");
+  static_assert(!ScaleFmt<SF>::codebook || Bits == 4, "packq_gemv: the NF4I8 codebook format is 4-bit");
   static constexpr int group = ScaleFmt<SF>::group;
   static constexpr int codes_per_chunk = 8 * kChunkBytes / Bits;   // 32 or 16
   static constexpr int codes_per_word = 32 / Bits;                 // 8 or 4
@@ -138,6 +184,7 @@ __host__ __device__ constexpr int chunks_of(int k) {
 }
 template <int Bits, int SF = kScaleBf16G64>
 __host__ __device__ constexpr bool k_supported(int k) {
+  if (ScaleFmt<SF>::codebook && Bits != 4) return false;
   return k >= ScaleFmt<SF>::group && k % ScaleFmt<SF>::group == 0 &&
          chunks_of<Bits>(k) <= kMaxChunksPerLane * kMaxPasses;
 }
@@ -145,6 +192,7 @@ __host__ __device__ constexpr bool k_supported_bits(int bits, int k, int sf = kS
   if (sf == kScaleF16G128)
     return bits == 4 ? k_supported<4, kScaleF16G128>(k)
                      : (bits == 8 ? k_supported<8, kScaleF16G128>(k) : false);
+  if (sf == kScaleBf16G128Nf4i8) return bits == 4 ? k_supported<4, kScaleBf16G128Nf4i8>(k) : false;
   if (sf != kScaleBf16G64) return false;
   return bits == 4 ? k_supported<4>(k) : (bits == 8 ? k_supported<8>(k) : false);
 }
@@ -205,8 +253,12 @@ __device__ __forceinline__ float bf16_hi(uint32_t w) { return __uint_as_float(w 
 // scale s) into kRows accumulators: part[r] = the chunk's exact integer
 // dot from 0, then acc[r] += s * part[r]. Element order within the chunk
 // is the storage order: word q holds codes e0 + q*codes_per_word + j at
-// bit position j*Bits (the low nibble / byte first).
-template <int Bits, int kRows>
+// bit position j*Bits (the low nibble / byte first). Under the codebook
+// format the integer is the level the nibble indexes (expand_nf4_int8:
+// the word's low half gives codes 8q .. 8q+3 as bytes, the high half
+// codes 8q+4 .. 8q+7), paired with the activations exactly as the offset
+// codes are, so the chain is the same sequence of FMAs.
+template <int Bits, int kRows, int SF = kScaleBf16G64>
 __device__ __forceinline__ void consume_chunk(const uint4& wchunk, float s,
                                               const uint4 (&xv)[kRows][Fmt<Bits>::window_vecs],
                                               float (&acc)[kRows]) {
@@ -214,7 +266,28 @@ __device__ __forceinline__ void consume_chunk(const uint4& wchunk, float s,
   float part[kRows];
 #pragma unroll
   for (int r = 0; r < kRows; ++r) part[r] = 0.f;
-  if constexpr (Bits == 4) {
+  if constexpr (Bits == 4 && ScaleFmt<SF>::codebook) {
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const uint32_t word = words[q];  // codes 8q .. 8q+7; activations xv[r][q]
+      const uint32_t lo = expand_nf4_int8(word & 0xFFFFu);  // levels of codes 8q .. 8q+3
+      const uint32_t hi = expand_nf4_int8(word >> 16);      // levels of codes 8q+4 .. 8q+7
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const float2 c = make_float2(static_cast<float>(static_cast<int8_t>(lo >> (8 * j))),
+                                     static_cast<float>(static_cast<int8_t>(hi >> (8 * j))));
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) {
+          const uint32_t xa = (j < 2) ? xv[r][q].x : xv[r][q].y;
+          const uint32_t xb = (j < 2) ? xv[r][q].z : xv[r][q].w;
+          const float x0 = (j & 1) ? bf16_hi(xa) : bf16_lo(xa);
+          const float x1 = (j & 1) ? bf16_hi(xb) : bf16_lo(xb);
+          part[r] = __fmaf_rn(c.x, x0, part[r]);
+          part[r] = __fmaf_rn(c.y, x1, part[r]);
+        }
+      }
+    }
+  } else if constexpr (Bits == 4) {
     const __half2 bias = __float2half2_rn(1032.f);  // 1024 + 8
 #pragma unroll
     for (int q = 0; q < 4; ++q) {
@@ -325,7 +398,7 @@ __device__ __forceinline__ void pass_row_dots(const uint8_t* __restrict__ w,
       const int row = row_base + st * G::rows_per_step + group;
       if (row >= n) continue;  // per lane; no barrier inside
       const int i = st * NC + c;
-      consume_chunk<Bits, kRows>(wv[i], ScaleFmt<SF>::to_float(sv[i]), xv, acc[st]);
+      consume_chunk<Bits, kRows, SF>(wv[i], ScaleFmt<SF>::to_float(sv[i]), xv, acc[st]);
     }
   }
 }
@@ -410,8 +483,8 @@ __device__ __forceinline__ void pass_row_dots_pair(
       const int row = row_base + st * G::rows_per_step + group;
       if (row >= n) continue;
       const int i = st * NC + c;
-      consume_chunk<Bits, kRows>(wv0[i], ScaleFmt<SF>::to_float(sv0[i]), xv, acc0[st]);
-      consume_chunk<Bits, kRows>(wv1[i], ScaleFmt<SF>::to_float(sv1[i]), xv, acc1[st]);
+      consume_chunk<Bits, kRows, SF>(wv0[i], ScaleFmt<SF>::to_float(sv0[i]), xv, acc0[st]);
+      consume_chunk<Bits, kRows, SF>(wv1[i], ScaleFmt<SF>::to_float(sv1[i]), xv, acc1[st]);
     }
   }
 }
@@ -528,16 +601,25 @@ __host__ __device__ constexpr bool k_compiled(int k) {
 // format 1 (f16 per 128) at the 128-multiples up to 2560 — the AutoRound
 // hybrid's widths and the test geometries below them. Every launcher
 // checks this before its dispatch; a width outside it throws.
+// Format 2 (the NF4I8 codebook) compiles at the full GLM-5.3 routed
+// expert widths — 6144 (gate / up), 2048 / 1024 / 512 (the down at worlds
+// 1 / 2 / 4) — and the two test geometries 128 and 256.
 __host__ __device__ constexpr bool sf_compiled(int sf, int k) {
-  return sf == kScaleBf16G64 ? k_compiled(k)
-                             : (sf == kScaleF16G128 && k_compiled(k) && k % 128 == 0 && k <= 2560);
+  if (sf == kScaleBf16G64) return k_compiled(k);
+  if (sf == kScaleF16G128) return k_compiled(k) && k % 128 == 0 && k <= 2560;
+  if (sf == kScaleBf16G128Nf4i8)
+    return k == 128 || k == 256 || k == 512 || k == 1024 || k == 2048 || k == 6144;
+  return false;
 }
 // Dispatch over the scale format: f(std::integral_constant<int, SF>{}).
 template <typename F>
 __host__ inline void dispatch_sf(int sf, F&& f) {
   if (sf == kScaleBf16G64) f(std::integral_constant<int, kScaleBf16G64>{});
   else if (sf == kScaleF16G128) f(std::integral_constant<int, kScaleF16G128>{});
-  else throw std::invalid_argument("packq_gemv: the scale format must be 0 (bf16 per 64) or 1 (f16 per 128)");
+  else if (sf == kScaleBf16G128Nf4i8) f(std::integral_constant<int, kScaleBf16G128Nf4i8>{});
+  else
+    throw std::invalid_argument(
+        "packq_gemv: the scale format must be 0 (bf16 per 64), 1 (f16 per 128) or 2 (the NF4I8 codebook)");
 }
 // Dispatch over the code width: f(std::integral_constant<int, Bits>{}).
 template <typename F>

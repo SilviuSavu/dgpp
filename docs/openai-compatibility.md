@@ -257,6 +257,51 @@ visibility. Clients should accumulate content and logprobs independently.
 `include_obfuscation` defaults to true and adds random padding to delta events;
 false disables it. Padding is transport-only and consumes no model tokens.
 
+## Completion timings (DGPP extension)
+
+Successful chat and legacy completion responses carry a top-level `timings`
+object. Streams carry it once, on the final usage chunk when
+`stream_options.include_usage` is true, or on the last choice's terminal
+chunk otherwise. Usage remains opt-in for streams. An interrupted stream
+that never reaches its final chunk reports no timings.
+
+```json
+"timings": {"prompt_n": 32, "cache_n": 96, "predicted_n": 32,
+            "prompt_ms": 200, "prompt_per_token_ms": 6.25,
+            "prompt_per_second": 160,
+            "predicted_ms": 1550, "predicted_per_token_ms": 50,
+            "predicted_per_second": 20}
+```
+
+The field and rate conventions follow llama.cpp's
+[`server_slot_stats` at revision `9c2e0e491a82`](https://github.com/ggml-org/llama.cpp/blob/9c2e0e491a822adae1f0b1c831adb4160057d24f/tools/server/server-common.h)
+and its [final chat stream event](https://github.com/ggml-org/llama.cpp/blob/9c2e0e491a822adae1f0b1c831adb4160057d24f/tools/server/server-task.cpp):
+
+- `prompt_n` counts newly computed prompt tokens: `usage.prompt_tokens` minus
+  `usage.prompt_tokens_details.cached_tokens`. `cache_n` counts the reused prefix.
+- `prompt_ms` measures engine admission to the first generated token on the
+  service's monotonic clock. It excludes the initial admission queue and includes
+  waits between resumed prefill chunks. Prompt rates use `prompt_n`.
+- `predicted_n` counts all completion tokens, including the first token produced
+  by prefill. `predicted_ms` spans the first to the last generated token, with a
+  minimum of 0.001 ms once a token exists. Decode rates use the tokens after the
+  prefill pick: `predicted_n - 1` for a single choice. A one-token completion
+  therefore has zero decode rate and zero decode time per token.
+- A completion that generated no token has zero timing windows and rates.
+
+For DGPP requests with multiple choices, prompt counts, cache counts and prefill
+latency describe choice 0, matching the existing prompt usage accounting.
+`predicted_n` is summed across choices; the decode window spans the earliest
+first token to the latest last token, and rates exclude one prefill pick per
+choice that generated any tokens. This reports aggregate request throughput,
+including intervening work when choices cannot all run at once.
+
+These are additional response fields. Existing `usage` counts, `/metrics` and
+`/v1/metrics` counters, Prometheus measurements, and throughput logs retain
+all of their existing definitions. In particular, usage counts the full prompt,
+TTFT continues to include queue wait, and engine execution counters remain
+separate from per-request elapsed time.
+
 Errors use `{ "error": { "message", "type", "param", "code" } }`.
 An overload detected before opening a stream returns HTTP 503. Errors after
 stream headers have been sent use an SSE error followed by `[DONE]`.

@@ -703,8 +703,10 @@ GlmLayerStream::GlmLayerStream(const GlmTextConfig& cfg,
 // footprint is known from the byte formula before a single byte moves.
 // The measure is the larger of the device's free memory and the host's
 // MemAvailable (the GB10's unified pool is the host's memory; the page
-// cache is reclaimable); the headroom covers the staging mirror, the CUDA
-// context and the bus's buffers.
+// cache is reclaimable); the headroom covers the staging mirror (2.2 GiB
+// measured), the CUDA context and the bus's buffers — 4 GiB, the serving
+// plan's figure (2026-10-09; the 8 GiB before it refused the full GLM-5.3
+// diagnostic forward on a node with 104 GiB free).
 void GlmLayerStream::check_resident_footprint_fits() const {
   size_t footprint = globals_bytes(cfg_, rank_, world_, head_);
   for (int l = 0; l < cfg_.num_hidden_layers; ++l)
@@ -716,7 +718,7 @@ void GlmLayerStream::check_resident_footprint_fits() const {
   if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) return;
   const size_t available = host_mem_available_bytes();
   constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
-  const size_t headroom = static_cast<size_t>(8 * kGiB);
+  const size_t headroom = static_cast<size_t>(4 * kGiB);
   DGPP_LOG_INFO("glm loader: rank {} resident footprint {:.1f} GiB; device "
                 "free {:.1f} of {:.1f} GiB, host available {:.1f} GiB",
                 rank_, footprint / kGiB, free_bytes / kGiB, total_bytes / kGiB,
@@ -725,7 +727,7 @@ void GlmLayerStream::check_resident_footprint_fits() const {
   if (footprint + headroom > free_bytes)
     throw std::runtime_error(
         "glm loader: the resident model (" + std::to_string(footprint >> 30) +
-        " GiB + 8 GiB headroom) does not fit in the device's free memory (" +
+        " GiB + 4 GiB headroom) does not fit in the device's free memory (" +
         std::to_string(free_bytes >> 30) +
         " GiB) — free memory on this node, use a larger world, or run in "
         "streaming residency");

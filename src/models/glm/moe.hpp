@@ -84,6 +84,11 @@ struct GlmMoeConfig {
   // row's result is still its own whatever rows share the launch). A family
   // opts in after its own fabric A/B (DeepSeek-V4-Flash).
   bool shared_mma_aside = false;
+  // The Mixed346 contract (2026-10-09): the layer keeps the int8 code and
+  // scale copies of the routed rows the converted experts multiply
+  // (kMoeInputHadamard32Int8), sized with the scratch; off for every other
+  // family (no bytes).
+  bool routed_int8_activations = false;
   MoeRouterMode router_mode = MoeRouterMode::SigmoidBias;
 
   // Weight bytes of one routed expert (payload + block scales): the number
@@ -166,7 +171,24 @@ struct GlmMoeWeights {
   bool shared_packq() const { return shared_packed[0].packed != nullptr; }
   const GlmPackedMatrix* experts_packed = nullptr;
   bool packq() const { return experts_packed != nullptr; }
+  // The routed experts' input transform (2026-10-08, the NF4I8
+  // checkpoint): kMoeInputHadamard32 rotates every routed projection's
+  // input by a normalized 32-wide Hadamard (gate/up on the expert input,
+  // down on the SwiGLU output) — the basis the experts were quantized in.
+  // The residual stream, the router and the shared expert are not rotated.
+  // kMoeInputHadamard32Int8 (2026-10-09, the Mixed346 checkpoint): the
+  // same rotation, then the row quantized to int8 codes with one fp32
+  // scale per 128 values (kernels/hadamard32.cu), the activation form the
+  // Mixed346 (format 3) triples multiply; an expert of such a layer whose
+  // triple is the baseline's (format 0, an "existing" expert) reads the
+  // plain bf16 rows like the shared expert.
+  int routed_input_transform = 0;
+  bool routed_hadamard32() const { return routed_input_transform == 1 || routed_input_transform == 2; }
+  bool routed_activation_int8() const { return routed_input_transform == 2; }
 };
+constexpr int kMoeInputPlain = 0;
+constexpr int kMoeInputHadamard32 = 1;
+constexpr int kMoeInputHadamard32Int8 = 2;
 
 // The decode path's device-side expert table entry: the
 // slot kernels read the ROUTE from device memory, so the weight views

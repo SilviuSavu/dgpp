@@ -354,7 +354,7 @@ def check_cluster(cfg, binary, log_dir, stage_dir, user, peer_binary=None, *, lo
         if local_only and rank:
             continue
         probe_env = dict(cfg["node_env"][rank])
-        if "DGPP_NO_SWAP" in os.environ:
+        if "DGPP_NO_SWAP" in os.environ and "DGPP_NO_SWAP" not in probe_env:
             probe_env["DGPP_NO_SWAP"] = os.environ["DGPP_NO_SWAP"]
         spec = {"rank": rank, "nodes": cfg["nodes"], "model": cfg["model"],
                 "table_model": (cfg.get("engine", {}) or {}).get("ngram_table_model"),

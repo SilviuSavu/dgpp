@@ -146,6 +146,18 @@ class GlmMoeLayer {
   const float* decode_slot_down() const { return d_slot_down_; }
   const float* decode_weights() const { return d_weights_; }
 
+  // The Mixed346 contract's expert-input codes (cfg.routed_int8_activations;
+  // null otherwise): a caller that produces the token rows' codes and
+  // scales itself — the post-attention norm fused with the quantizer
+  // (glm_rmsnorm_bf16_quant_int8) — writes them here ([rows, hidden] int8 at
+  // stride hidden, [rows, hidden / 128] fp32) and marks them ready; the
+  // next decode or tensor-core prefill enqueue then skips its own quantizer
+  // (the gathered-row GEMV chain quantizes its gathered rows regardless).
+  // The mark is consumed by that enqueue.
+  int8_t* hidden_codes() const { return d_hidden_q_; }
+  float* hidden_code_scales() const { return d_hidden_qs_; }
+  void mark_hidden_codes_ready(bool ready) { hidden_codes_ready_ = ready; }
+
   // Fills graph slot `table_slot`'s device expert-view table from the
   // CURRENT binding (an async H2D on `stream`; the caller syncs before
   // capturing). Must run OUTSIDE stream capture, once per slot, before
@@ -279,6 +291,16 @@ class GlmMoeLayer {
   // decode-slot scratch (cudaMalloc; sized to decode_slots*(top_k+1) rows —
   // the slot layout the kernels index: routed K + shared, per token)
   uint16_t* d_slot_act_ = nullptr;  // [slots, inter] (fused gate/up/swiglu)
+  uint16_t* d_hidden_rot_ = nullptr;  // [decode_slots, hidden]: the token rows rotated by H32 (NF4I8)
+  // The Mixed346 contract's int8 activation codes and fp32 scales
+  // (cfg.routed_int8_activations; kernels/hadamard32.cu): the expert-input
+  // rows [max(rows_total, decode_slots), hidden] and the SwiGLU rows
+  // [max(rows_total, decode rows), inter] — decode and prefill share them.
+  int8_t* d_hidden_q_ = nullptr;
+  float* d_hidden_qs_ = nullptr;
+  bool hidden_codes_ready_ = false;  // mark_hidden_codes_ready: the next enqueue reads them as given
+  int8_t* d_act_q_ = nullptr;
+  float* d_act_qs_ = nullptr;
   float* d_slot_down_ = nullptr;
   int32_t* d_slot_order_ = nullptr; // [slots] expert-sorted execution order
   // GlmMoeConfig::shared_mma_aside: the shared expert's own chain.
