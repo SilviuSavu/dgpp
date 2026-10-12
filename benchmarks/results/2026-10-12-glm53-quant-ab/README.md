@@ -177,3 +177,22 @@ across serving stacks per the tool's own docs). Safety gate: 1 warning
    default lane.
 3. Open engine follow-ups: structured-output compliance (cat O) and
    streaming token_ids at concurrency.
+
+## Power-cycle survival (field-tested 2026-10-12, all 4 nodes cycled)
+
+What survived: fstab/exports/NFS-server enablement, resident images on all
+ranks, hub symlinks, weight stores, netplan LAN+fabric, memlock limits
+(/etc/security/limits.d/99-nv-spark-limits.conf), ssh mesh, head binary
+(peers re-stage per boot by design). What broke: spark3/spark4 came back
+with zero farm mounts — boot-time mount -a raced spark1's NFS server and
+nofail skipped silently, leaving the systemd .mount units failed
+(recovery: reset-failed + explicit mounts; nfs-common is masked and not
+involved).
+
+Hardening applied (all 4 nodes, fstab backed up to
+/etc/fstab.bak-dgpp-automount): x-systemd.automount added to the four
+dgpp-store entries — mounts attach on first access, no boot race.
+Verified live: converted /mnt/dgpp-store-spark4 on spark3 to an automount
+unit, first access attached NFS v4.2 and read through it. The lane does
+not autostart by design; recovery is ./glm53m346-dgpp-start.sh (~60-90s
+warm). Post-cycle lane boot: rank 0 serving in 60s.
