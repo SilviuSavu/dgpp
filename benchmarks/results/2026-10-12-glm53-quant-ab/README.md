@@ -196,3 +196,24 @@ Verified live: converted /mnt/dgpp-store-spark4 on spark3 to an automount
 unit, first access attached NFS v4.2 and read through it. The lane does
 not autostart by design; recovery is ./glm53m346-dgpp-start.sh (~60-90s
 warm). Post-cycle lane boot: rank 0 serving in 60s.
+
+## Whole-7 verify A/B: the adaptive schedule wins decisively — rejected
+
+Question: should every greedy slot verify the full 7-draft block instead
+of the confidence schedule choosing among [1,3,5,7]? Variant: m346 lane
+with mtp_schedule off, dflash_batch_rows 0 (whole block, fixed),
+deploy/cluster_glm-5.3_mixed346_w4_d7.json, suite in m346-d7-suite.json.
+
+| class | adaptive C1/C8 | whole-7 C1/C8 |
+|---|---|---|
+| prose | 30.7 / 50.4 | 22.4 / 28.1 |
+| code | 36.2 / 49.5 | 29.3 / 29.3 |
+| json | 33.0 / 55.0 | 27.5 / 37.1 |
+| math | 33.3 / 57.1 | 27.5 / 44.5 |
+| chat | 24.4 / 51.4 | 17.1 / 30.3 |
+
+Class-mean deltas: C1 -21%, C8 -36%. Always paying 7 verify rows when
+the confidence head knows the prefix will not survive is pure waste;
+the schedule already verifies 7 exactly when it pays (threshold: prefix
+survival > 0.533 at 32 ms/row). Output is bitwise identical either way
+(docs/mtp.md) — this is purely step economics. Adaptive stays the lane.
