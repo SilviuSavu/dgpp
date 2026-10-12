@@ -1,0 +1,563 @@
+{
+ "tasks": [
+  {
+   "id": "math00",
+   "cls": "math",
+   "prompt": "Two trains start 450 km apart and run toward each other on parallel tracks, one at 60 km/h and the other at 90 km/h. After how many MINUTES do they meet? (integer, round down if needed)\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 180
+  },
+  {
+   "id": "math01",
+   "cls": "math",
+   "prompt": "Two trains start 300 km apart and run toward each other on parallel tracks, one at 80 km/h and the other at 70 km/h. After how many MINUTES do they meet? (integer, round down if needed)\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 120
+  },
+  {
+   "id": "math02",
+   "cls": "math",
+   "prompt": "Two trains start 520 km apart and run toward each other on parallel tracks, one at 55 km/h and the other at 65 km/h. After how many MINUTES do they meet? (integer, round down if needed)\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 260
+  },
+  {
+   "id": "math03",
+   "cls": "math",
+   "prompt": "Two trains start 600 km apart and run toward each other on parallel tracks, one at 72 km/h and the other at 84 km/h. After how many MINUTES do they meet? (integer, round down if needed)\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 230
+  },
+  {
+   "id": "math04",
+   "cls": "math",
+   "prompt": "A shop marks an item at 250 lei and then applies a 20% discount. What is the final price in whole lei (rounded DOWN to the integer lei)?\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 200
+  },
+  {
+   "id": "math05",
+   "cls": "math",
+   "prompt": "A shop marks an item at 80 lei and then applies a 15% discount. What is the final price in whole lei (rounded DOWN to the integer lei)?\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 68
+  },
+  {
+   "id": "math06",
+   "cls": "math",
+   "prompt": "A shop marks an item at 1200 lei and then applies a 35% discount. What is the final price in whole lei (rounded DOWN to the integer lei)?\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 780
+  },
+  {
+   "id": "math07",
+   "cls": "math",
+   "prompt": "A shop marks an item at 45 lei and then applies a 10% discount. What is the final price in whole lei (rounded DOWN to the integer lei)?\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 40
+  },
+  {
+   "id": "math08",
+   "cls": "math",
+   "prompt": "A shop marks an item at 640 lei and then applies a 25% discount. What is the final price in whole lei (rounded DOWN to the integer lei)?\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 480
+  },
+  {
+   "id": "math09",
+   "cls": "math",
+   "prompt": "Pipe A fills a tank in 6 hours alone; pipe B fills the same tank in 3 hours alone. With both open, how many WHOLE HOURS does it take to fill one tank? Round down.\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 2
+  },
+  {
+   "id": "math10",
+   "cls": "math",
+   "prompt": "Pipe A fills a tank in 4 hours alone; pipe B fills the same tank in 12 hours alone. With both open, how many WHOLE HOURS does it take to fill one tank? Round down.\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 3
+  },
+  {
+   "id": "math11",
+   "cls": "math",
+   "prompt": "Pipe A fills a tank in 10 hours alone; pipe B fills the same tank in 15 hours alone. With both open, how many WHOLE HOURS does it take to fill one tank? Round down.\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 6
+  },
+  {
+   "id": "math12",
+   "cls": "math",
+   "prompt": "Pipe A fills a tank in 8 hours alone; pipe B fills the same tank in 24 hours alone. With both open, how many WHOLE HOURS does it take to fill one tank? Round down.\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 6
+  },
+  {
+   "id": "math13",
+   "cls": "math",
+   "prompt": "An arithmetic sequence starts at 7 with common difference 3. What is the 40-th term?\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 124
+  },
+  {
+   "id": "math14",
+   "cls": "math",
+   "prompt": "An arithmetic sequence starts at 100 with common difference -4. What is the 25-th term?\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 4
+  },
+  {
+   "id": "math15",
+   "cls": "math",
+   "prompt": "An arithmetic sequence starts at 2 with common difference 6. What is the 30-th term?\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 176
+  },
+  {
+   "id": "math16",
+   "cls": "math",
+   "prompt": "A solution weighs 400 g and contains 25% salt by weight. How many grams of salt are in it?\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 100
+  },
+  {
+   "id": "math17",
+   "cls": "math",
+   "prompt": "A solution weighs 600 g and contains 30% salt by weight. How many grams of salt are in it?\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 180
+  },
+  {
+   "id": "math18",
+   "cls": "math",
+   "prompt": "A solution weighs 250 g and contains 40% salt by weight. How many grams of salt are in it?\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 100
+  },
+  {
+   "id": "math19",
+   "cls": "math",
+   "prompt": "A rectangle has perimeter 46 m and width 9 m. What is its area in square meters?\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 126
+  },
+  {
+   "id": "math20",
+   "cls": "math",
+   "prompt": "A triangle has base 12 cm and height 9 cm. What is its area in square centimeters?\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 54
+  },
+  {
+   "id": "math21",
+   "cls": "math",
+   "prompt": "A cube has volume 343 cubic cm. What is its total surface area in square cm?\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 294
+  },
+  {
+   "id": "math22",
+   "cls": "math",
+   "prompt": "If 3x + 7 = 34, what is x?\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 9
+  },
+  {
+   "id": "math23",
+   "cls": "math",
+   "prompt": "If 5(x - 4) = 3x + 10, what is x?\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 15
+  },
+  {
+   "id": "math24",
+   "cls": "math",
+   "prompt": "The sum of three consecutive integers is 87. What is the largest of them?\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 30
+  },
+  {
+   "id": "math25",
+   "cls": "math",
+   "prompt": "A car rental costs 40 lei flat plus 0.25 lei per km. A bill came to 115 lei. How many km were driven?\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 300
+  },
+  {
+   "id": "math26",
+   "cls": "math",
+   "prompt": "Anna reads 18 pages a day for 5 days, then 26 pages a day for 3 days. How many pages total?\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 168
+  },
+  {
+   "id": "math27",
+   "cls": "math",
+   "prompt": "A shirt costs 45 lei after a 25% discount. What was the original price in lei?\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 60
+  },
+  {
+   "id": "math28",
+   "cls": "math",
+   "prompt": "Tom has twice as many marbles as Sara, and together they have 54. How many does Tom have?\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 36
+  },
+  {
+   "id": "math29",
+   "cls": "math",
+   "prompt": "A class of 30 students: 60% are girls. How many boys are there?\n\nThink briefly, then end your reply with exactly 'Answer: <integer>' (no units, no commas).",
+   "answer": 12
+  },
+  {
+   "id": "code_reverse_words",
+   "cls": "code",
+   "prompt": "Write this Python function exactly as specified:\n\n```python\ndef reverse_words(s): '''Return the words of s in reverse order, joined by single spaces.'''\n    pass\n```\n\nReply with ONLY a ```python code block containing the complete function (no explanation, no input/output examples).",
+   "tests": [
+    "assert reverse_words('a b c') == 'c b a'",
+    "assert reverse_words('hello') == 'hello'",
+    "assert reverse_words(' x  y ') == 'y x'"
+   ]
+  },
+  {
+   "id": "code_fizzbuzz",
+   "cls": "code",
+   "prompt": "Write this Python function exactly as specified:\n\n```python\ndef fizzbuzz(n): '''Return a list of 1..n where multiples of 3 are 'Fizz', of 5 'Buzz', of both 'FizzBuzz'.'''\n    pass\n```\n\nReply with ONLY a ```python code block containing the complete function (no explanation, no input/output examples).",
+   "tests": [
+    "assert fizzbuzz(5) == [1,2,'Fizz',4,'Buzz']",
+    "assert fizzbuzz(15)[-1] == 'FizzBuzz'",
+    "assert len(fizzbuzz(100)) == 100"
+   ]
+  },
+  {
+   "id": "code_two_sum",
+   "cls": "code",
+   "prompt": "Write this Python function exactly as specified:\n\n```python\ndef two_sum(nums, target): '''Return indices (i, j), i < j, of the two numbers summing to target; nums always has exactly one solution.'''\n    pass\n```\n\nReply with ONLY a ```python code block containing the complete function (no explanation, no input/output examples).",
+   "tests": [
+    "assert two_sum([2,7,11,15], 9) == (0,1)",
+    "assert two_sum([3,2,4], 6) == (1,2)",
+    "assert two_sum([3,3], 6) == (0,1)"
+   ]
+  },
+  {
+   "id": "code_roman",
+   "cls": "code",
+   "prompt": "Write this Python function exactly as specified:\n\n```python\ndef roman(n): '''Convert integer n (1..3999) to a Roman numeral string.'''\n    pass\n```\n\nReply with ONLY a ```python code block containing the complete function (no explanation, no input/output examples).",
+   "tests": [
+    "assert roman(9) == 'IX'",
+    "assert roman(1994) == 'MCMXCIV'",
+    "assert roman(3888) == 'MMMDCCCLXXXVIII'"
+   ]
+  },
+  {
+   "id": "code_brackets",
+   "cls": "code",
+   "prompt": "Write this Python function exactly as specified:\n\n```python\ndef balanced(s): '''Return True iff s has properly nested/ordered (), [], {}.'''\n    pass\n```\n\nReply with ONLY a ```python code block containing the complete function (no explanation, no input/output examples).",
+   "tests": [
+    "assert balanced('([{}])') == True",
+    "assert balanced('(]') == False",
+    "assert balanced('((') == False",
+    "assert balanced('') == True"
+   ]
+  },
+  {
+   "id": "code_flatten",
+   "cls": "code",
+   "prompt": "Write this Python function exactly as specified:\n\n```python\ndef flatten(x): '''Flatten an arbitrarily nested list of ints into a flat list, in order.'''\n    pass\n```\n\nReply with ONLY a ```python code block containing the complete function (no explanation, no input/output examples).",
+   "tests": [
+    "assert flatten([1,[2,[3,4],5],6]) == [1,2,3,4,5,6]",
+    "assert flatten([]) == []",
+    "assert flatten([[[]],1]) == [1]"
+   ]
+  },
+  {
+   "id": "code_wordfreq",
+   "cls": "code",
+   "prompt": "Write this Python function exactly as specified:\n\n```python\ndef wordfreq(text): '''Return a dict word -> count, lowercase keys, split on whitespace.'''\n    pass\n```\n\nReply with ONLY a ```python code block containing the complete function (no explanation, no input/output examples).",
+   "tests": [
+    "assert wordfreq('a b a') == {'a':2,'b':1}",
+    "assert wordfreq('') == {}",
+    "assert wordfreq('A a B') == {'a':2,'b':1}"
+   ]
+  },
+  {
+   "id": "code_transpose",
+   "cls": "code",
+   "prompt": "Write this Python function exactly as specified:\n\n```python\ndef transpose(m): '''Transpose a rectangular matrix given as list of rows.'''\n    pass\n```\n\nReply with ONLY a ```python code block containing the complete function (no explanation, no input/output examples).",
+   "tests": [
+    "assert transpose([[1,2],[3,4],[5,6]]) == [[1,3,5],[2,4,6]]",
+    "assert transpose([[1]]) == [[1]]",
+    "assert transpose(transpose([[1,2,3]])) == [[1,2,3]]"
+   ]
+  },
+  {
+   "id": "code_bsearch",
+   "cls": "code",
+   "prompt": "Write this Python function exactly as specified:\n\n```python\ndef lower_bound(a, x): '''Return the index of the first element of sorted list a that is >= x; len(a) if none.'''\n    pass\n```\n\nReply with ONLY a ```python code block containing the complete function (no explanation, no input/output examples).",
+   "tests": [
+    "assert lower_bound([1,3,5,7], 5) == 2",
+    "assert lower_bound([1,3,5,7], 4) == 2",
+    "assert lower_bound([1,3,5], 9) == 3",
+    "assert lower_bound([], 1) == 0"
+   ]
+  },
+  {
+   "id": "code_caesar",
+   "cls": "code",
+   "prompt": "Write this Python function exactly as specified:\n\n```python\ndef caesar(s, k): '''Shift lowercase letters by k (mod 26), leave everything else unchanged.'''\n    pass\n```\n\nReply with ONLY a ```python code block containing the complete function (no explanation, no input/output examples).",
+   "tests": [
+    "assert caesar('abc', 2) == 'cde'",
+    "assert caesar('xyz', 3) == 'abc'",
+    "assert caesar('a b!', 1) == 'b c!'"
+   ]
+  },
+  {
+   "id": "code_is_prime",
+   "cls": "code",
+   "prompt": "Write this Python function exactly as specified:\n\n```python\ndef is_prime(n): '''Return True iff n is a prime number (n >= 2).'''\n    pass\n```\n\nReply with ONLY a ```python code block containing the complete function (no explanation, no input/output examples).",
+   "tests": [
+    "assert is_prime(2) == True",
+    "assert is_prime(97) == True",
+    "assert is_prime(1) == False",
+    "assert is_prime(91) == False"
+   ]
+  },
+  {
+   "id": "code_moving_avg",
+   "cls": "code",
+   "prompt": "Write this Python function exactly as specified:\n\n```python\ndef moving_avg(xs, w): '''Return the list of window averages for windows of size w (len(xs) >= w >= 1).'''\n    pass\n```\n\nReply with ONLY a ```python code block containing the complete function (no explanation, no input/output examples).",
+   "tests": [
+    "assert moving_avg([1,2,3,4], 2) == [1.5,2.5,3.5]",
+    "assert moving_avg([5], 1) == [5.0]",
+    "assert moving_avg([1,2,3], 3) == [2.0]"
+   ]
+  },
+  {
+   "id": "code_dedupe",
+   "cls": "code",
+   "prompt": "Write this Python function exactly as specified:\n\n```python\ndef dedupe(xs): '''Return xs with duplicates removed, keeping FIRST occurrences in order.'''\n    pass\n```\n\nReply with ONLY a ```python code block containing the complete function (no explanation, no input/output examples).",
+   "tests": [
+    "assert dedupe([1,2,1,3,2]) == [1,2,3]",
+    "assert dedupe([]) == []",
+    "assert dedupe(['a','a','b']) == ['a','b']"
+   ]
+  },
+  {
+   "id": "code_gcd",
+   "cls": "code",
+   "prompt": "Write this Python function exactly as specified:\n\n```python\ndef gcd(a, b): '''Return the greatest common divisor of a and b (both positive).'''\n    pass\n```\n\nReply with ONLY a ```python code block containing the complete function (no explanation, no input/output examples).",
+   "tests": [
+    "assert gcd(12, 18) == 6",
+    "assert gcd(7, 13) == 1",
+    "assert gcd(100, 75) == 25"
+   ]
+  },
+  {
+   "id": "code_pivot",
+   "cls": "code",
+   "prompt": "Write this Python function exactly as specified:\n\n```python\ndef pivot_index(xs): '''Return the index where the sum of elements strictly left equals the sum strictly right; -1 if none.'''\n    pass\n```\n\nReply with ONLY a ```python code block containing the complete function (no explanation, no input/output examples).",
+   "tests": [
+    "assert pivot_index([1,7,3,6,5,6]) == 3",
+    "assert pivot_index([1,2,3]) == -1",
+    "assert pivot_index([2,1,-1]) == 0"
+   ]
+  },
+  {
+   "id": "schema00",
+   "cls": "schema",
+   "prompt": "Register the person: name 'Alex Popescu', age 34, email 'alex.popescu@example.org'.\n\nReply with ONLY a single JSON object (no markdown fence, no prose) using exactly these keys: `name`, `age`, `email`. ",
+   "must": {
+    "name": "Alex Popescu",
+    "age": 34
+   },
+   "types": {
+    "name": "str",
+    "age": "int",
+    "email": "str"
+   }
+  },
+  {
+   "id": "schema01",
+   "cls": "schema",
+   "prompt": "Describe the location: city 'Cluj-Napoca', zip '400124', country 'Romania'.\n\nReply with ONLY a single JSON object (no markdown fence, no prose) using exactly these keys: `city`, `zip`, `country`. ",
+   "must": {
+    "country": "Romania",
+    "city": "Cluj-Napoca"
+   },
+   "types": {
+    "city": "str",
+    "zip": "str",
+    "country": "str"
+   }
+  },
+  {
+   "id": "schema02",
+   "cls": "schema",
+   "prompt": "Create the account record: id 42, tags ['admin','ops'], active true.\n\nReply with ONLY a single JSON object (no markdown fence, no prose) using exactly these keys: `id`, `tags`, `active`. ",
+   "must": {
+    "id": 42,
+    "active": true
+   },
+   "types": {
+    "id": "int",
+    "tags": "list",
+    "active": "bool"
+   }
+  },
+  {
+   "id": "schema03",
+   "cls": "schema",
+   "prompt": "Product entry: title 'USB-C cable', price 19.99, in_stock 12.\n\nReply with ONLY a single JSON object (no markdown fence, no prose) using exactly these keys: `title`, `price`, `in_stock`. ",
+   "must": {
+    "title": "USB-C cable",
+    "in_stock": 12
+   },
+   "types": {
+    "title": "str",
+    "price": "float",
+    "in_stock": "int"
+   }
+  },
+  {
+   "id": "schema04",
+   "cls": "schema",
+   "prompt": "Nested user object: user is an object with name 'Maria' and roles ['dev','reviewer'].\n\nReply with ONLY a single JSON object (no markdown fence, no prose) using exactly these keys: `user`. user must be a nested object with keys name (string) and roles (list)",
+   "must": {
+    "user": {
+     "name": "Maria",
+     "roles": [
+      "dev",
+      "reviewer"
+     ]
+    }
+   },
+   "types": {
+    "user": "dict"
+   }
+  },
+  {
+   "id": "schema05",
+   "cls": "schema",
+   "prompt": "Music album record: album 'Kind of Blue', tracks = exactly these five track names in order: 'So What', 'Freddie Freeloader', 'Blue in Green', 'All Blues', 'Flamenco Sketches'.\n\nReply with ONLY a single JSON object (no markdown fence, no prose) using exactly these keys: `album`, `tracks`. tracks must be exactly 5 strings in the given order",
+   "must": {
+    "album": "Kind of Blue",
+    "tracks": [
+     "So What",
+     "Freddie Freeloader",
+     "Blue in Green",
+     "All Blues",
+     "Flamenco Sketches"
+    ]
+   },
+   "types": {
+    "album": "str",
+    "tracks": "list"
+   }
+  },
+  {
+   "id": "schema06",
+   "cls": "schema",
+   "prompt": "Exam result: score 88, grade 'B', passed true.\n\nReply with ONLY a single JSON object (no markdown fence, no prose) using exactly these keys: `score`, `grade`, `passed`. ",
+   "must": {
+    "score": 88,
+    "grade": "B",
+    "passed": true
+   },
+   "types": {
+    "score": "int",
+    "grade": "str",
+    "passed": "bool"
+   }
+  },
+  {
+   "id": "schema07",
+   "cls": "schema",
+   "prompt": "Database config: host 'db.internal', port 5432, tls true.\n\nReply with ONLY a single JSON object (no markdown fence, no prose) using exactly these keys: `host`, `port`, `tls`. ",
+   "must": {
+    "host": "db.internal",
+    "port": 5432,
+    "tls": true
+   },
+   "types": {
+    "host": "str",
+    "port": "int",
+    "tls": "bool"
+   }
+  },
+  {
+   "id": "schema08",
+   "cls": "schema",
+   "prompt": "Repo card: repo 'dgpp', stars 217, fork false, language 'C++'.\n\nReply with ONLY a single JSON object (no markdown fence, no prose) using exactly these keys: `repo`, `stars`, `fork`, `language`. ",
+   "must": {
+    "repo": "dgpp",
+    "language": "C++"
+   },
+   "types": {
+    "repo": "str",
+    "stars": "int",
+    "fork": "bool",
+    "language": "str"
+   }
+  },
+  {
+   "id": "schema09",
+   "cls": "schema",
+   "prompt": "Payment: from 'ro-checking', to 'ch-savings', amount 125.50, currency 'CHF'.\n\nReply with ONLY a single JSON object (no markdown fence, no prose) using exactly these keys: `from`, `to`, `amount`, `currency`. ",
+   "must": {
+    "currency": "CHF",
+    "amount": 125.5
+   },
+   "types": {
+    "from": "str",
+    "to": "str",
+    "amount": "float",
+    "currency": "str"
+   }
+  },
+  {
+   "id": "schema10",
+   "cls": "schema",
+   "prompt": "Telemetry: sensor 'attic-01', celsius 21.5, status 'ok'.\n\nReply with ONLY a single JSON object (no markdown fence, no prose) using exactly these keys: `sensor`, `celsius`, `status`. ",
+   "must": {
+    "sensor": "attic-01",
+    "status": "ok"
+   },
+   "types": {
+    "sensor": "str",
+    "celsius": "float",
+    "status": "str"
+   }
+  },
+  {
+   "id": "schema11",
+   "cls": "schema",
+   "prompt": "Calendar date: day 'Monday', month 1, year 2026.\n\nReply with ONLY a single JSON object (no markdown fence, no prose) using exactly these keys: `day`, `month`, `year`. ",
+   "must": {
+    "day": "Monday",
+    "month": 1,
+    "year": 2026
+   },
+   "types": {
+    "day": "str",
+    "month": "int",
+    "year": "int"
+   }
+  },
+  {
+   "id": "schema12",
+   "cls": "schema",
+   "prompt": "Model card: model 'GLM-5.3', quant 'Mixed346', bits 4.2.\n\nReply with ONLY a single JSON object (no markdown fence, no prose) using exactly these keys: `model`, `quant`, `bits`. ",
+   "must": {
+    "model": "GLM-5.3",
+    "quant": "Mixed346",
+    "bits": 4.2
+   },
+   "types": {
+    "model": "str",
+    "quant": "str",
+    "bits": "float"
+   }
+  },
+  {
+   "id": "schema13",
+   "cls": "schema",
+   "prompt": "Queue state: queue 'decode', depth 64, max_depth 64.\n\nReply with ONLY a single JSON object (no markdown fence, no prose) using exactly these keys: `queue`, `depth`, `max_depth`. ",
+   "must": {
+    "queue": "decode",
+    "depth": 64,
+    "max_depth": 64
+   },
+   "types": {
+    "queue": "str",
+    "depth": "int",
+    "max_depth": "int"
+   }
+  },
+  {
+   "id": "schema14",
+   "cls": "schema",
+   "prompt": "Book record: author 'Ursula K. Le Guin', pages 304, isbn '978-0441478125'.\n\nReply with ONLY a single JSON object (no markdown fence, no prose) using exactly these keys: `author`, `pages`, `isbn`. ",
+   "must": {
+    "author": "Ursula K. Le Guin",
+    "pages": 304,
+    "isbn": "978-0441478125"
+   },
+   "types": {
+    "author": "str",
+    "pages": "int",
+    "isbn": "str"
+   }
+  }
+ ]
+}

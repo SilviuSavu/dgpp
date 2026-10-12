@@ -1,0 +1,561 @@
+{
+ "lane": "mixed346",
+ "model": "glm-5.3",
+ "summary": {
+  "math": {
+   "n": 30,
+   "pass": 30
+  },
+  "code": {
+   "n": 15,
+   "pass": 15
+  },
+  "schema": {
+   "n": 15,
+   "pass": 15
+  },
+  "total": 60
+ },
+ "rows": [
+  {
+   "id": "math00",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 84,
+   "wall_s": 8.44,
+   "content": "Combined speed: 60 + 90 = 150 km/h. Time to meet: 450 \u00f7 150 = 3 hours = 180 minutes.\n\nAnswer: 180"
+  },
+  {
+   "id": "math01",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 83,
+   "wall_s": 7.08,
+   "content": "Combined speed: 80 + 70 = 150 km/h. Time to meet: 300 \u00f7 150 = 2 hours = 120 minutes.\n\nAnswer: 120"
+  },
+  {
+   "id": "math02",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 121,
+   "wall_s": 13.46,
+   "content": "Combined speed: 55 + 65 = 120 km/h.\n\nTime to meet: 520 \u00f7 120 = 4\u2153 hours = 4 hours 20 minutes = 260 minutes.\n\nAnswer: 260"
+  },
+  {
+   "id": "math03",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 141,
+   "wall_s": 12.07,
+   "content": "Combined speed: 72 + 84 = 156 km/h.\n\nTime to meet: 600 / 156 \u2248 3.846 hours.\n\nIn minutes: 3.846 \u00d7 60 \u2248 230.77 minutes.\n\nRounded down: 230.\n\nAnswer: 230"
+  },
+  {
+   "id": "math04",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 115,
+   "wall_s": 11.62,
+   "content": "The marked price is 250 lei. A 20% discount means the price is reduced to 80% of the original:\n\n250 \u00d7 0.80 = 200 lei\n\nSince 200 is already a whole number, rounding down changes nothing.\n\nAnswer: 200"
+  },
+  {
+   "id": "math05",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 121,
+   "wall_s": 11.97,
+   "content": "The marked price is 80 lei. A 15% discount means the price is reduced to 85% of the original:\n\n80 \u00d7 0.85 = 68 lei\n\nSince 68 is already a whole number, rounding down doesn't change it.\n\nAnswer: 68"
+  },
+  {
+   "id": "math06",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 118,
+   "wall_s": 12.55,
+   "content": "The discount is 35% of 1200 = 420 lei, so the final price is 1200 \u2212 420 = 780 lei, which is already a whole number.\n\nAnswer: 780"
+  },
+  {
+   "id": "math07",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 93,
+   "wall_s": 9.3,
+   "content": "45 \u00d7 0.90 = 40.5 lei, which rounds down to 40.\n\nAnswer: 40"
+  },
+  {
+   "id": "math08",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 77,
+   "wall_s": 9.4,
+   "content": "The discount is 25% of 640 = 160 lei. The final price is 640 \u2212 160 = 480 lei, which is already a whole number.\n\nAnswer: 480"
+  },
+  {
+   "id": "math09",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 171,
+   "wall_s": 16.75,
+   "content": "Pipe A's rate: 1/6 tank per hour. Pipe B's rate: 1/3 tank per hour.\n\nCombined rate: 1/6 + 1/3 = 1/2 tank per hour.\n\nTime to fill: 1 \u00f7 (1/2) = 2 hours exactly. Rounded down, that's still 2.\n\nAnswer: 2"
+  },
+  {
+   "id": "math10",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 150,
+   "wall_s": 12.45,
+   "content": "Pipe A fills 1/4 tank per hour, pipe B fills 1/12 tank per hour. Together: 1/4 + 1/12 = 3/12 + 1/12 = 4/12 = 1/3 tank per hour. So the tank fills in exactly 3 hours.\n\nAnswer: 3"
+  },
+  {
+   "id": "math11",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 144,
+   "wall_s": 10.59,
+   "content": "Pipe A's rate: 1/10 tank per hour. Pipe B's rate: 1/15 tank per hour.\n\nCombined rate: 1/10 + 1/15 = 3/30 + 2/30 = 5/30 = 1/6 tank per hour.\n\nTime to fill: 6 hours exactly, so rounding down gives 6.\n\nAnswer: 6"
+  },
+  {
+   "id": "math12",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 154,
+   "wall_s": 12.6,
+   "content": "Pipe A's rate: 1/8 tank per hour. Pipe B's rate: 1/24 tank per hour.\n\nCombined rate: 1/8 + 1/24 = 3/24 + 1/24 = 4/24 = 1/6 tank per hour.\n\nTime to fill: 6 hours exactly, so rounding down gives 6.\n\nAnswer: 6"
+  },
+  {
+   "id": "math13",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 153,
+   "wall_s": 14.59,
+   "content": "The n-th term of an arithmetic sequence is a\u2099 = a\u2081 + (n\u22121)d.\n\nHere, a\u2081 = 7 and d = 3, so:\n\na\u2084\u2080 = 7 + (40 \u2212 1)\u00b73 = 7 + 39\u00b73 = 7 + 117 = 124\n\nAnswer: 124"
+  },
+  {
+   "id": "math14",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 127,
+   "wall_s": 14.33,
+   "content": "The nth term of an arithmetic sequence is a\u2099 = a\u2081 + (n\u22121)d.\n\nHere, a\u2081 = 100 and d = \u22124, so:\n\na\u2082\u2085 = 100 + (25 \u2212 1)(\u22124) = 100 \u2212 96 = 4\n\nAnswer: 4"
+  },
+  {
+   "id": "math15",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 120,
+   "wall_s": 10.39,
+   "content": "The n-th term of an arithmetic sequence is a + (n\u22121)d. Here, a = 2 and d = 6, so the 30th term is 2 + 29 \u00d7 6 = 2 + 174 = 176.\n\nAnswer: 176"
+  },
+  {
+   "id": "math16",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 67,
+   "wall_s": 5.44,
+   "content": "25% of 400 g = 0.25 \u00d7 400 = 100 g of salt.\n\nAnswer: 100"
+  },
+  {
+   "id": "math17",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 89,
+   "wall_s": 9.15,
+   "content": "To find the amount of salt, multiply the total weight by the percentage of salt:\n\n30% of 600 g = 0.30 \u00d7 600 = 180 g\n\nAnswer: 180"
+  },
+  {
+   "id": "math18",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 78,
+   "wall_s": 7.72,
+   "content": "The solution weighs 250 g with 40% salt by weight, so the salt amount is 0.40 \u00d7 250 = 100 g.\n\nAnswer: 100"
+  },
+  {
+   "id": "math19",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 109,
+   "wall_s": 11.16,
+   "content": "Perimeter = 2(length + width), so 46 = 2(length + 9), giving length + 9 = 23, so length = 14 m.\n\nArea = 14 \u00d7 9 = 126 square meters.\n\nAnswer: 126"
+  },
+  {
+   "id": "math20",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 67,
+   "wall_s": 5.89,
+   "content": "Area = (1/2) \u00d7 base \u00d7 height = (1/2) \u00d7 12 \u00d7 9 = 54 square centimeters.\n\nAnswer: 54"
+  },
+  {
+   "id": "math21",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 79,
+   "wall_s": 9.02,
+   "content": "The cube's volume is 343 = 7\u00b3, so each side is 7 cm. The surface area is 6 \u00d7 7\u00b2 = 6 \u00d7 49 = 294.\n\nAnswer: 294"
+  },
+  {
+   "id": "math22",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 50,
+   "wall_s": 5.08,
+   "content": "Solving: 3x + 7 = 34 \u2192 3x = 27 \u2192 x = 9\n\nAnswer: 9"
+  },
+  {
+   "id": "math23",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 104,
+   "wall_s": 10.57,
+   "content": "Solving step by step:\n\n5(x - 4) = 3x + 10\n5x - 20 = 3x + 10\n5x - 3x = 10 + 20\n2x = 30\nx = 15\n\nAnswer: 15"
+  },
+  {
+   "id": "math24",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 132,
+   "wall_s": 12.93,
+   "content": "Let the three consecutive integers be n, n+1, and n+2.\n\nTheir sum: n + (n+1) + (n+2) = 87\n3n + 3 = 87\n3n = 84\nn = 28\n\nThe integers are 28, 29, and 30.\n\nAnswer: 30"
+  },
+  {
+   "id": "math25",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 88,
+   "wall_s": 9.22,
+   "content": "Setting up the equation: 40 + 0.25k = 115\n\nSolving: 0.25k = 115 \u2212 40 = 75, so k = 75 / 0.25 = 300\n\nAnswer: 300"
+  },
+  {
+   "id": "math26",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 61,
+   "wall_s": 5.94,
+   "content": "18 \u00d7 5 = 90 pages, and 26 \u00d7 3 = 78 pages. Adding them: 90 + 78 = 168.\n\nAnswer: 168"
+  },
+  {
+   "id": "math27",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 108,
+   "wall_s": 10.49,
+   "content": "After a 25% discount, the shirt costs 75% of the original price. So 0.75 \u00d7 original = 45, which means the original price = 45 \u00f7 0.75 = 60.\n\nAnswer: 60"
+  },
+  {
+   "id": "math28",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 92,
+   "wall_s": 11.23,
+   "content": "Let Sara have *s* marbles. Tom has 2*s*, so together: 3*s* = 54, meaning *s* = 18. Tom has 2 \u00d7 18 = 36.\n\nAnswer: 36"
+  },
+  {
+   "id": "math29",
+   "cls": "math",
+   "pass": true,
+   "why": "",
+   "tokens": 62,
+   "wall_s": 6.84,
+   "content": "60% of 30 students are girls: 0.60 \u00d7 30 = 18 girls. So boys = 30 \u2212 18 = 12.\n\nAnswer: 12"
+  },
+  {
+   "id": "code_reverse_words",
+   "cls": "code",
+   "pass": true,
+   "why": "",
+   "tokens": 125,
+   "wall_s": 12.1,
+   "content": "```python\ndef reverse_words(s):\n    '''Return the words of s in reverse order, joined by single spaces.'''\n    return ' '.join(reversed(s.split()))\n```"
+  },
+  {
+   "id": "code_fizzbuzz",
+   "cls": "code",
+   "pass": true,
+   "why": "",
+   "tokens": 317,
+   "wall_s": 22.94,
+   "content": "```python\ndef fizzbuzz(n):\n    '''Return a list of 1..n where multiples of 3 are 'Fizz', of 5 'Buzz', of both 'FizzBuzz'.'''\n    result = []\n    for i in range(1, n + 1):\n        if i % 3 == 0 and i % 5 == 0:\n            result.append('FizzBuzz')\n        elif i % 3 == 0:\n            result.append('Fizz')\n        elif i % 5 == 0:\n            result.append('Buzz')\n        else:\n            result.append(i)\n    return result\n```"
+  },
+  {
+   "id": "code_two_sum",
+   "cls": "code",
+   "pass": true,
+   "why": "",
+   "tokens": 594,
+   "wall_s": 50.37,
+   "content": "```python\ndef two_sum(nums, target):\n    '''Return indices (i, j), i < j, of the two numbers summing to target; nums always has exactly one solution.'''\n    seen = {}\n    for j, num in enumerate(nums):\n        complement = target - num\n        if complement in seen:\n            return (seen[complement], j)\n        seen[num] = j\n    return None\n```"
+  },
+  {
+   "id": "code_roman",
+   "cls": "code",
+   "pass": true,
+   "why": "",
+   "tokens": 551,
+   "wall_s": 40.39,
+   "content": "```python\ndef roman(n):\n    '''Convert integer n (1..3999) to a Roman numeral string.'''\n    values = [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1]\n    symbols = ['M', 'CM', 'D', 'CD', 'C', 'XC', 'L', 'XL', 'X', 'IX', 'V', 'IV', 'I']\n    result = []\n    for value, symbol in zip(values, symbols):\n        while n >= value:\n            result.append(symbol)\n            n -= value\n    return ''.join(result)\n```"
+  },
+  {
+   "id": "code_brackets",
+   "cls": "code",
+   "pass": true,
+   "why": "",
+   "tokens": 335,
+   "wall_s": 26.24,
+   "content": "```python\ndef balanced(s):\n    '''Return True iff s has properly nested/ordered (), [], {}.'''\n    stack = []\n    pairs = {')': '(', ']': '[', '}': '{'}\n    for ch in s:\n        if ch in '([{':\n            stack.append(ch)\n        elif ch in pairs:\n            if not stack or stack.pop() != pairs[ch]:\n                return False\n    return not stack\n```"
+  },
+  {
+   "id": "code_flatten",
+   "cls": "code",
+   "pass": true,
+   "why": "",
+   "tokens": 1272,
+   "wall_s": 105.09,
+   "content": "```python\ndef flatten(x):\n    '''Flatten an arbitrarily nested list of ints into a flat list, in order.'''\n    result = []\n    for item in x:\n        if isinstance(item, list):\n            result.extend(flatten(item))\n        else:\n            result.append(item)\n    return result\n```"
+  },
+  {
+   "id": "code_wordfreq",
+   "cls": "code",
+   "pass": true,
+   "why": "",
+   "tokens": 179,
+   "wall_s": 13.69,
+   "content": "```python\ndef wordfreq(text):\n    '''Return a dict word -> count, lowercase keys, split on whitespace.'''\n    counts = {}\n    for word in text.lower().split():\n        counts[word] = counts.get(word, 0) + 1\n    return counts\n```"
+  },
+  {
+   "id": "code_transpose",
+   "cls": "code",
+   "pass": true,
+   "why": "",
+   "tokens": 715,
+   "wall_s": 60.73,
+   "content": "```python\ndef transpose(m):\n    '''Transpose a rectangular matrix given as list of rows.'''\n    return [list(row) for row in zip(*m)]\n```"
+  },
+  {
+   "id": "code_bsearch",
+   "cls": "code",
+   "pass": true,
+   "why": "",
+   "tokens": 555,
+   "wall_s": 45.08,
+   "content": "```python\ndef lower_bound(a, x):\n    '''Return the index of the first element of sorted list a that is >= x; len(a) if none.'''\n    lo, hi = 0, len(a)\n    while lo < hi:\n        mid = (lo + hi) // 2\n        if a[mid] < x:\n            lo = mid + 1\n        else:\n            hi = mid\n    return lo\n```"
+  },
+  {
+   "id": "code_caesar",
+   "cls": "code",
+   "pass": true,
+   "why": "",
+   "tokens": 288,
+   "wall_s": 21.54,
+   "content": "```python\ndef caesar(s, k):\n    '''Shift lowercase letters by k (mod 26), leave everything else unchanged.'''\n    result = []\n    for c in s:\n        if 'a' <= c <= 'z':\n            result.append(chr((ord(c) - ord('a') + k) % 26 + ord('a')))\n        else:\n            result.append(c)\n    return ''.join(result)\n```"
+  },
+  {
+   "id": "code_is_prime",
+   "cls": "code",
+   "pass": true,
+   "why": "",
+   "tokens": 563,
+   "wall_s": 43.31,
+   "content": "```python\ndef is_prime(n):\n    '''Return True iff n is a prime number (n >= 2).'''\n    if n < 2:\n        return False\n    if n < 4:\n        return True\n    if n % 2 == 0:\n        return False\n    i = 3\n    while i * i <= n:\n        if n % i == 0:\n            return False\n        i += 2\n    return True\n```"
+  },
+  {
+   "id": "code_moving_avg",
+   "cls": "code",
+   "pass": true,
+   "why": "",
+   "tokens": 252,
+   "wall_s": 19.97,
+   "content": "```python\ndef moving_avg(xs, w):\n    '''Return the list of window averages for windows of size w (len(xs) >= w >= 1).'''\n    return [sum(xs[i:i + w]) / w for i in range(len(xs) - w + 1)]\n```"
+  },
+  {
+   "id": "code_dedupe",
+   "cls": "code",
+   "pass": true,
+   "why": "",
+   "tokens": 289,
+   "wall_s": 22.77,
+   "content": "```python\ndef dedupe(xs):\n    '''Return xs with duplicates removed, keeping FIRST occurrences in order.'''\n    seen = set()\n    result = []\n    for x in xs:\n        if x not in seen:\n            seen.add(x)\n            result.append(x)\n    return result\n```"
+  },
+  {
+   "id": "code_gcd",
+   "cls": "code",
+   "pass": true,
+   "why": "",
+   "tokens": 205,
+   "wall_s": 18.37,
+   "content": "```python\ndef gcd(a, b):\n    '''Return the greatest common divisor of a and b (both positive).'''\n    while b:\n        a, b = b, a % b\n    return a\n```"
+  },
+  {
+   "id": "code_pivot",
+   "cls": "code",
+   "pass": true,
+   "why": "",
+   "tokens": 387,
+   "wall_s": 33.37,
+   "content": "```python\ndef pivot_index(xs):\n    '''Return the index where the sum of elements strictly left equals the sum strictly right; -1 if none.'''\n    total = sum(xs)\n    left_sum = 0\n    for i, x in enumerate(xs):\n        if left_sum == total - left_sum - x:\n            return i\n        left_sum += x\n    return -1\n```"
+  },
+  {
+   "id": "schema00",
+   "cls": "schema",
+   "pass": true,
+   "why": "",
+   "tokens": 124,
+   "wall_s": 12.15,
+   "content": "{\"name\": \"Alex Popescu\", \"age\": 34, \"email\": \"alex.popescu@example.org\"}"
+  },
+  {
+   "id": "schema01",
+   "cls": "schema",
+   "pass": true,
+   "why": "",
+   "tokens": 108,
+   "wall_s": 10.27,
+   "content": "{\"city\": \"Cluj-Napoca\", \"zip\": \"400124\", \"country\": \"Romania\"}"
+  },
+  {
+   "id": "schema02",
+   "cls": "schema",
+   "pass": true,
+   "why": "",
+   "tokens": 123,
+   "wall_s": 10.7,
+   "content": "{\"id\": 42, \"tags\": [\"admin\", \"ops\"], \"active\": true}"
+  },
+  {
+   "id": "schema03",
+   "cls": "schema",
+   "pass": true,
+   "why": "",
+   "tokens": 108,
+   "wall_s": 13.04,
+   "content": "{\"title\": \"USB-C cable\", \"price\": 19.99, \"in_stock\": 12}"
+  },
+  {
+   "id": "schema04",
+   "cls": "schema",
+   "pass": true,
+   "why": "",
+   "tokens": 74,
+   "wall_s": 7.06,
+   "content": "{\"user\":{\"name\":\"Maria\",\"roles\":[\"dev\",\"reviewer\"]}}"
+  },
+  {
+   "id": "schema05",
+   "cls": "schema",
+   "pass": true,
+   "why": "",
+   "tokens": 79,
+   "wall_s": 7.75,
+   "content": "{\"album\": \"Kind of Blue\", \"tracks\": [\"So What\", \"Freddie Freeloader\", \"Blue in Green\", \"All Blues\", \"Flamenco Sketches\"]}"
+  },
+  {
+   "id": "schema06",
+   "cls": "schema",
+   "pass": true,
+   "why": "",
+   "tokens": 98,
+   "wall_s": 10.3,
+   "content": "{\"score\": 88, \"grade\": \"B\", \"passed\": true}"
+  },
+  {
+   "id": "schema07",
+   "cls": "schema",
+   "pass": true,
+   "why": "",
+   "tokens": 107,
+   "wall_s": 10.22,
+   "content": "{\"host\": \"db.internal\", \"port\": 5432, \"tls\": true}"
+  },
+  {
+   "id": "schema08",
+   "cls": "schema",
+   "pass": true,
+   "why": "",
+   "tokens": 102,
+   "wall_s": 10.6,
+   "content": "{\"repo\": \"dgpp\", \"stars\": 217, \"fork\": false, \"language\": \"C++\"}"
+  },
+  {
+   "id": "schema09",
+   "cls": "schema",
+   "pass": true,
+   "why": "",
+   "tokens": 313,
+   "wall_s": 28.66,
+   "content": "{\"from\": \"ro-checking\", \"to\": \"ch-savings\", \"amount\": 125.5, \"currency\": \"CHF\"}"
+  },
+  {
+   "id": "schema10",
+   "cls": "schema",
+   "pass": true,
+   "why": "",
+   "tokens": 118,
+   "wall_s": 11.28,
+   "content": "{\"sensor\": \"attic-01\", \"celsius\": 21.5, \"status\": \"ok\"}"
+  },
+  {
+   "id": "schema11",
+   "cls": "schema",
+   "pass": true,
+   "why": "",
+   "tokens": 132,
+   "wall_s": 12.48,
+   "content": "{\"day\": \"Monday\", \"month\": 1, \"year\": 2026}"
+  },
+  {
+   "id": "schema12",
+   "cls": "schema",
+   "pass": true,
+   "why": "",
+   "tokens": 202,
+   "wall_s": 17.2,
+   "content": "{\"model\": \"GLM-5.3\", \"quant\": \"Mixed346\", \"bits\": 4.2}"
+  },
+  {
+   "id": "schema13",
+   "cls": "schema",
+   "pass": true,
+   "why": "",
+   "tokens": 108,
+   "wall_s": 9.42,
+   "content": "{\"queue\": \"decode\", \"depth\": 64, \"max_depth\": 64}"
+  },
+  {
+   "id": "schema14",
+   "cls": "schema",
+   "pass": true,
+   "why": "",
+   "tokens": 111,
+   "wall_s": 8.36,
+   "content": "{\"author\": \"Ursula K. Le Guin\", \"pages\": 304, \"isbn\": \"978-0441478125\"}"
+  }
+ ]
+}

@@ -113,3 +113,67 @@ suite on the lane would close it.
   serving-side winner IF a task-level eval confirms no generated-quality
   regression. Recommended next gate: 50-100 prompt task eval
   (gsm8k-style + code + schema) on the m346 lane vs int8 transcripts.
+
+## Task-level eval gate (the switch condition): PASSED — winner = Mixed346
+
+60 gradeable tasks (30 gsm8k-style math with computed keys, 15 code with
+executable asserts, 15 strict-JSON schema checks), greedy, max_tokens 2048,
+identical prompts per lane; scripts/task_eval.py (grader self-tested: 15
+reference code solutions + math/schema probes green before any model run).
+
+| lane | math | code | schema | total |
+|---|---|---|---|---|
+| int8 RTN (reference) | 30/30 | 15/15 | 15/15 | **60/60** |
+| Mixed346 A8 | 30/30 | 15/15 | 15/15 | **60/60** |
+
+Perfect parity. Two key bugs found and fixed during grading were authoring
+errors (round-down vs round; a float truncation), both cases where the
+model was right and the key was wrong. One task (code_flatten) needed
+max_tokens 2048 — the model reasons at length before emitting code; at
+1024 it burned the whole budget on reasoning with empty content.
+
+Winner: Mixed346 — task quality at parity, serving +5% C2/C8, +3.2% C4,
+higher draft acceptance. The m346 lane stays up as the new default
+(swap back anytime: ./glm53i8-dgpp-start.sh).
+
+## llama-benchy on the winner (eugr/llama-benchy 0.4.0, PyPI)
+
+OpenAI-endpoint pp/tg benchmark, MTP-aware, 3 runs each, book corpus
+(Gutenberg), tokenizer from the local m346 checkpoint. benchy/*.json.
+
+| test | pp tok/s | tg tok/s | e2e TTFT ms |
+|---|---|---|---|
+| pp512/tg128/c1 | 461.4 ± 3.9 | 30.3 ± 1.5 | 1112 |
+| pp512/tg256/c1 | 465.0 | 23.5 | 1104 |
+| pp2048/tg128/c1 | 537.0 | 25.1 | 3817 |
+| pp2048/tg256/c1 | 541.6 | 24.0 | 3784 |
+| pp2048/tg256/c8 | 491.3 | 23.3 (per stream) | 18203 |
+
+Notes: first invocation 404'd — the endpoint needs --base-url .../v1
+(the tool appends /chat/completions itself). At c8 the tool logs "No
+complete token_ids in response, using stream usage token count": the
+engine streams usage but not token ids; throughput accounting unaffected.
+
+## tool-eval-bench on the winner (SeraphimSerapis/tool-eval-bench)
+
+69 deterministic scenarios, mock tools, pass/partial/fail scoring,
+parallel 4. tool-eval/results.json + report md.
+
+Score 126/138 points (91%), rating ★★★★★ Excellent, deployability 66,
+median turn 19.4 s, 516,887 tokens total. Categories: A-F and H,J,L,N
+perfect (tool selection, parameter precision, chains, restraint, error
+recovery, localization); I Context & State 85%, K Safety 96%, M
+Autonomous Planning 67% (1 fail), O Structured Output 50% (worst — raw
+JSON-schema compliance; this is the engine's structured-output/grammar
+path, quant-independent, and matches the schema-drift seen in category O
+across serving stacks per the tool's own docs). Safety gate: 1 warning
+(TC-51 batched a dependent tool call instead of sequencing).
+
+## Summary
+
+1. NF4I8: parity quality/throughput, prose-C1 regression — not adopted.
+2. Mixed346: +3-5% serving at C2-C8, acceptance up, task eval 60/60,
+   tool-eval Excellent, llama-benchy baseline recorded — adopted as the
+   default lane.
+3. Open engine follow-ups: structured-output compliance (cat O) and
+   streaming token_ids at concurrency.
